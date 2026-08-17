@@ -1,3 +1,5 @@
+"""Defensive parsers for adidas session, GPS, heart-rate, elevation, and GPX data."""
+
 from __future__ import annotations
 
 import bisect
@@ -9,7 +11,6 @@ from pathlib import Path
 
 from .models import CompanionFiles, Session, TimedValue, TrackPoint
 
-SPORT_TYPE_IDS = {"running": frozenset({"1"})}
 JOIN_TOLERANCE_MS = 5_000
 
 

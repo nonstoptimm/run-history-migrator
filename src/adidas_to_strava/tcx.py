@@ -1,3 +1,5 @@
+"""Standards-compliant TCX generation, atomic writing, and validation."""
+
 from __future__ import annotations
 
 import os
@@ -32,10 +34,7 @@ def output_filename(session: Session) -> str:
         (session.start_time_ms + session.start_timezone_offset_ms) / 1000, tz=UTC
     )
     distance_km = session.distance_m / 1000
-    return (
-        f"{start:%Y-%m-%d_%H%M%S}_{distance_km:.2f}km_"
-        f"{session.session_id[:8]}.tcx"
-    )
+    return f"{start:%Y-%m-%d_%H%M%S}_{distance_km:.2f}km_{session.session_id[:8]}.tcx"
 
 
 def build_tcx(session: Session, points: list[TrackPoint]) -> ET.ElementTree:
@@ -51,9 +50,7 @@ def build_tcx(session: Session, points: list[TrackPoint]) -> ET.ElementTree:
         f"{{{TCX_NS}}}Lap",
         {"StartTime": utc_timestamp(session.start_time_ms)},
     )
-    ET.SubElement(lap, f"{{{TCX_NS}}}TotalTimeSeconds").text = (
-        f"{session.duration_ms / 1000:.3f}"
-    )
+    ET.SubElement(lap, f"{{{TCX_NS}}}TotalTimeSeconds").text = f"{session.duration_ms / 1000:.3f}"
     ET.SubElement(lap, f"{{{TCX_NS}}}DistanceMeters").text = f"{session.distance_m:.3f}"
     ET.SubElement(lap, f"{{{TCX_NS}}}Calories").text = str(session.calories)
     ET.SubElement(lap, f"{{{TCX_NS}}}Intensity").text = "Active"
@@ -61,24 +58,18 @@ def build_tcx(session: Session, points: list[TrackPoint]) -> ET.ElementTree:
     track = ET.SubElement(lap, f"{{{TCX_NS}}}Track")
     for point in points:
         trackpoint = ET.SubElement(track, f"{{{TCX_NS}}}Trackpoint")
-        ET.SubElement(trackpoint, f"{{{TCX_NS}}}Time").text = utc_timestamp(
-            point.timestamp_ms
-        )
+        ET.SubElement(trackpoint, f"{{{TCX_NS}}}Time").text = utc_timestamp(point.timestamp_ms)
         position = ET.SubElement(trackpoint, f"{{{TCX_NS}}}Position")
-        ET.SubElement(position, f"{{{TCX_NS}}}LatitudeDegrees").text = (
-            f"{point.latitude:.12g}"
-        )
-        ET.SubElement(position, f"{{{TCX_NS}}}LongitudeDegrees").text = (
-            f"{point.longitude:.12g}"
-        )
+        ET.SubElement(position, f"{{{TCX_NS}}}LatitudeDegrees").text = f"{point.latitude:.12g}"
+        ET.SubElement(position, f"{{{TCX_NS}}}LongitudeDegrees").text = f"{point.longitude:.12g}"
         if point.altitude_m is not None:
-            ET.SubElement(trackpoint, f"{{{TCX_NS}}}AltitudeMeters").text = (
-                f"{point.altitude_m:.3f}"
-            )
+            ET.SubElement(
+                trackpoint, f"{{{TCX_NS}}}AltitudeMeters"
+            ).text = f"{point.altitude_m:.3f}"
         if point.distance_m is not None:
-            ET.SubElement(trackpoint, f"{{{TCX_NS}}}DistanceMeters").text = (
-                f"{point.distance_m:.3f}"
-            )
+            ET.SubElement(
+                trackpoint, f"{{{TCX_NS}}}DistanceMeters"
+            ).text = f"{point.distance_m:.3f}"
         if point.heart_rate is not None:
             heart_rate = ET.SubElement(
                 trackpoint,
@@ -86,10 +77,31 @@ def build_tcx(session: Session, points: list[TrackPoint]) -> ET.ElementTree:
                 {f"{{{XSI_NS}}}type": "HeartRateInBeatsPerMinute_t"},
             )
             ET.SubElement(heart_rate, f"{{{TCX_NS}}}Value").text = str(point.heart_rate)
-    ET.SubElement(activity, f"{{{TCX_NS}}}Notes").text = (
-        f"Converted from adidas Running session {session.session_id}"
-    )
+    ET.SubElement(
+        activity, f"{{{TCX_NS}}}Notes"
+    ).text = f"Converted from adidas Running session {session.session_id}"
     return ET.ElementTree(root)
+
+
+def validate_tcx(path: Path) -> datetime:
+    """Validate a generated TCX and return its timezone-aware activity start."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise ValueError(f"invalid TCX {path}: {exc}") from exc
+    activity = root.find(f".//{{{TCX_NS}}}Activity")
+    if activity is None or activity.get("Sport") != "Running":
+        raise ValueError(f"TCX {path} does not contain a Running activity")
+    activity_id = activity.findtext(f"{{{TCX_NS}}}Id")
+    if not activity_id:
+        raise ValueError(f"TCX {path} has no activity start time")
+    if not activity.findall(f".//{{{TCX_NS}}}Trackpoint"):
+        raise ValueError(f"TCX {path} has no trackpoints")
+    try:
+        parsed = datetime.fromisoformat(activity_id.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"TCX {path} has an invalid activity start time") from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def write_tcx(tree: ET.ElementTree, destination: Path) -> None:

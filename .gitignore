@@ -3,3 +3,9 @@ __pycache__/
 .venv/
 output/
 .DS_Store
+.env
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+upload-state.sqlite3
+upload-state.sqlite3-*

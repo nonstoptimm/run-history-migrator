@@ -4,16 +4,41 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adidas-to-strava"
-version = "0.1.0"
-description = "Convert adidas Running/Runtastic exports to Strava-importable TCX files"
+version = "0.2.0"
+description = "Convert adidas Running exports to TCX and optionally upload them to Strava"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [{name = "adidas-to-strava contributors"}]
-dependencies = []
+dependencies = [
+    "python-dotenv>=1.0,<2",
+    "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+adidas-to-strava = "adidas_to_strava.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
