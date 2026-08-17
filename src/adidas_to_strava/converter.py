@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .filters import DateRange, validate_sport
 from .manifest import load_manifest, write_manifest
-from .models import ManifestRow, Session
+from .models import ManifestRow, Session, TimedValue, TrackPoint
 from .parsers import (
     ParseError,
     index_companions,
@@ -28,6 +28,24 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class Summary:
+    """Aggregate outcomes and manifest rows from one conversion run.
+
+    Attributes:
+        scanned_sessions: Session JSON files found before any filtering.
+        before_since: Matching sessions earlier than the inclusive local ``since`` date.
+        after_until: Matching sessions later than the inclusive local ``until`` date.
+        non_sport: Date- and session-matching sessions with an unselected sport ID.
+        malformed_sessions: Session files skipped after a parse warning.
+        eligible_runs: Sessions remaining after filtering, ordering, and limiting.
+        converted: TCX files successfully written; always zero during a dry run.
+        skipped_no_gps: Eligible sessions without a usable timestamped GPS stream.
+        skipped_duplicate: Eligible sessions skipped because output was already converted.
+        missing_hr: GPS-backed sessions without usable optional heart-rate data.
+        missing_elevation: GPS-backed sessions without a separate elevation file.
+        errors: Eligible sessions whose TCX construction or write failed.
+        rows: Ordered manifest records produced for processed eligible sessions.
+    """
+
     scanned_sessions: int = 0
     before_since: int = 0
     after_until: int = 0
@@ -81,6 +99,43 @@ def convert(
     session_id: str | None = None,
     overwrite: bool = False,
 ) -> Summary:
+    """Convert selected adidas sessions to TCX and update the conversion manifest.
+
+    ``export_path`` is the export root containing ``Sport-sessions``. The optional
+    date bounds are inclusive and compare each session's adidas local calendar date.
+    ``sport`` is resolved to supported adidas sport IDs, and ``session_id`` selects
+    one exact canonical session ID. Sessions are ordered by start timestamp and then
+    session ID before ``limit`` is applied.
+
+    GPS is required: JSON is preferred and GPX is used as a fallback. Missing or
+    malformed heart-rate and elevation streams are non-fatal and are reflected in
+    counters or row warnings. Malformed session files, unusable GPS, and TCX failures
+    are logged as warnings or errors as appropriate.
+
+    Unless ``overwrite`` is true, an existing destination or a manifest row already
+    marked ``converted`` is treated as a duplicate. A real run writes TCX files and
+    rewrites ``output_dir/manifest.csv`` with existing rows plus rows for duplicates,
+    skipped sessions, successes, and errors. A dry run reads existing output and
+    manifest state for duplicate detection but creates or modifies no files.
+
+    Args:
+        export_path: Root directory of the extracted adidas export.
+        output_dir: Directory for TCX files and ``manifest.csv``.
+        since: Earliest included adidas local calendar date, inclusive.
+        until: Latest included adidas local calendar date, inclusive.
+        sport: Supported sport selector mapped to adidas sport IDs.
+        dry_run: If true, perform selection and parsing without writing files.
+        limit: Maximum eligible sessions to process after chronological ordering.
+        session_id: Exact canonical adidas session ID to process, if provided.
+        overwrite: If true, process sessions even when output is already recorded.
+
+    Returns:
+        A summary of filtering, conversion outcomes, warnings, and manifest rows.
+
+    Raises:
+        ValueError: If the export layout, filters, or existing manifest are invalid.
+        OSError: If the final manifest cannot be written.
+    """
     sport_sessions = export_path / "Sport-sessions"
     if not sport_sessions.is_dir():
         raise ValueError(f"missing Sport-sessions directory: {sport_sessions}")
@@ -120,8 +175,8 @@ def convert(
 
     companions = index_companions(sport_sessions)
     manifest_path = output_dir / "manifest.csv"
-    existing_manifest = load_manifest(manifest_path)
-    updated_manifest = dict(existing_manifest)
+    existing_manifest: dict[str, dict[str, str]] = load_manifest(manifest_path)
+    updated_manifest: dict[str, dict[str, str]] = dict(existing_manifest)
 
     for item in parsed:
         files = companions.get(item.session_id)
@@ -152,7 +207,7 @@ def convert(
             updated_manifest[item.session_id] = row.as_dict()
             continue
 
-        points = []
+        points: list[TrackPoint] = []
         if files and files.gps_json:
             try:
                 points, gps_warnings = parse_gps_json(files.gps_json)
@@ -178,7 +233,7 @@ def convert(
             updated_manifest[item.session_id] = row.as_dict()
             continue
 
-        heart_rate = []
+        heart_rate: list[TimedValue] = []
         if hr_file:
             try:
                 heart_rate, hr_warnings = parse_heart_rate(hr_file)
@@ -188,7 +243,7 @@ def convert(
         if not heart_rate and not any(point.heart_rate for point in points):
             summary.missing_hr += 1
 
-        elevation = []
+        elevation: list[TimedValue] = []
         if elevation_file:
             try:
                 elevation, elevation_warnings = parse_elevation(elevation_file)
@@ -222,6 +277,14 @@ def convert(
 
 
 def format_summary(summary: Summary) -> str:
+    """Render conversion totals without the per-session manifest rows.
+
+    Args:
+        summary: Completed conversion summary.
+
+    Returns:
+        A newline-delimited report suitable for CLI output.
+    """
     return "\n".join(
         (
             f"Scanned sessions: {summary.scanned_sessions}",

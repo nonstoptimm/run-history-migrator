@@ -1,10 +1,26 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import IO, NotRequired, TypedDict
 
 import requests
+
+
+class PostCall(TypedDict):
+    url: str
+    data: Mapping[str, str] | None
+    timeout: tuple[float, float] | None
+
+
+class RequestCall(TypedDict):
+    method: str
+    url: str
+    headers: Mapping[str, str] | None
+    data: Mapping[str, str] | None
+    files: NotRequired[Mapping[str, tuple[str, IO[bytes], str]]]
+    timeout: tuple[float, float] | None
 
 
 def make_export(root: Path) -> tuple[Path, Path]:
@@ -28,7 +44,7 @@ def write_session(
     if malformed:
         path.write_text("{", encoding="utf-8")
         return path
-    data = {
+    data: dict[str, object] = {
         "id": session_id,
         "start_time": start_ms,
         "start_time_timezone_offset": offset_ms,
@@ -60,7 +76,7 @@ def write_gps(
     *,
     start_ms: int = 1_672_531_200_000,
 ) -> Path:
-    rows = [
+    rows: list[dict[str, int | float]] = [
         {
             "timestamp": start_ms,
             "latitude": 48.1,
@@ -85,14 +101,18 @@ class FakeResponse:
     def __init__(
         self,
         status_code: int,
-        payload: Any,
-        headers: dict[str, str] | None = None,
+        payload: object,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
-        self.payload = payload
-        self.headers = headers or {}
+        self.payload: object = payload
+        self._headers = headers or {}
 
-    def json(self) -> Any:
+    @property
+    def headers(self) -> Mapping[str, str]:
+        return self._headers
+
+    def json(self) -> object:
         if isinstance(self.payload, ValueError):
             raise self.payload
         return self.payload
@@ -105,20 +125,44 @@ class FakeSession:
         posts: list[FakeResponse | requests.RequestException] | None = None,
         requests_: list[FakeResponse | requests.RequestException] | None = None,
     ) -> None:
-        self.posts = list(posts or [])
-        self.requests = list(requests_ or [])
-        self.post_calls: list[dict[str, Any]] = []
-        self.request_calls: list[dict[str, Any]] = []
+        self.posts: list[FakeResponse | requests.RequestException] = list(posts or [])
+        self.requests: list[FakeResponse | requests.RequestException] = list(requests_ or [])
+        self.post_calls: list[PostCall] = []
+        self.request_calls: list[RequestCall] = []
 
-    def post(self, url: str, **kwargs: Any) -> FakeResponse:
-        self.post_calls.append({"url": url, **kwargs})
+    def post(
+        self,
+        url: str,
+        *,
+        data: Mapping[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> FakeResponse:
+        self.post_calls.append({"url": url, "data": data, "timeout": timeout})
         response = self.posts.pop(0)
         if isinstance(response, requests.RequestException):
             raise response
         return response
 
-    def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
-        self.request_calls.append({"method": method, "url": url, **kwargs})
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, tuple[str, IO[bytes], str]] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> FakeResponse:
+        call: RequestCall = {
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "data": data,
+            "timeout": timeout,
+        }
+        if files is not None:
+            call["files"] = files
+        self.request_calls.append(call)
         response = self.requests.pop(0)
         if isinstance(response, requests.RequestException):
             raise response

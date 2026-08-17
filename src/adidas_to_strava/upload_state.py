@@ -14,12 +14,32 @@ def _now() -> str:
 
 
 class UploadStateStore:
-    """Persist one upload lifecycle per canonical adidas session UUID."""
+    """Persist one upload lifecycle per canonical adidas session UUID.
+
+    The backing SQLite database is created lazily: read-only methods such
+    as `get` tolerate a missing database file, while any method that
+    writes calls `initialize` first so the schema always exists before use.
+
+    Attributes:
+        path: The SQLite database file this store reads from and writes
+            to.
+    """
 
     def __init__(self, path: Path) -> None:
+        """Initialize the store without touching the filesystem yet.
+
+        Args:
+            path: The SQLite database file to use, created on first write.
+        """
         self.path = path
 
     def initialize(self) -> None:
+        """Create the `uploads` table and parent directory if missing.
+
+        Safe to call repeatedly: the table is created only if it does not
+        already exist, so existing rows and their `status` values are
+        never reset.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute(
@@ -40,6 +60,16 @@ class UploadStateStore:
             )
 
     def get(self, session_id: str) -> UploadRecord | None:
+        """Return the persisted upload record for one adidas session.
+
+        Args:
+            session_id: The canonical adidas session UUID to look up.
+
+        Returns:
+            The stored record, or ``None`` if the database file does not
+            exist yet or has no row for `session_id` (for example, in a
+            dry run, which never creates the database).
+        """
         if not self.path.exists():
             return None
         with self._connect() as connection:
@@ -49,6 +79,21 @@ class UploadStateStore:
         return self._record(row) if row else None
 
     def begin_attempt(self, session_id: str, source_tcx: Path, *, force: bool = False) -> None:
+        """Record the start of a submission attempt with status ``submitting``.
+
+        Args:
+            session_id: The canonical adidas session UUID being submitted.
+            source_tcx: The TCX file being submitted in this attempt.
+            force: Whether this attempt should resubmit a previously
+                completed session. When ``True``, or when no row exists
+                yet, all Strava identifiers and timestamps from any prior
+                attempt are cleared as part of starting fresh; when
+                ``False`` and a row already exists, only the source file,
+                status, attempt count, and timestamp are updated, leaving
+                any previously recorded Strava upload ID in place so a
+                genuinely interrupted (not forced) resubmission can still
+                resume.
+        """
         self.initialize()
         with self._connect() as connection:
             existing = connection.execute(
@@ -86,6 +131,14 @@ class UploadStateStore:
                 )
 
     def mark_submitted(self, session_id: str, upload_id: int) -> None:
+        """Record a successful submission with status ``submitted``.
+
+        Args:
+            session_id: The canonical adidas session UUID that was
+                submitted.
+            upload_id: Strava's upload ID, stored so processing can be
+                resumed later with `get`.
+        """
         self._update(
             session_id,
             """
@@ -96,6 +149,13 @@ class UploadStateStore:
         )
 
     def mark_processing(self, session_id: str, status: str) -> None:
+        """Record an in-progress poll result with status ``processing``.
+
+        Args:
+            session_id: The canonical adidas session UUID being polled.
+            status: Strava's latest status text, truncated to 1000
+                characters and stored for diagnostics.
+        """
         self._update(
             session_id,
             "status = 'processing', error_warning = ?",
@@ -108,6 +168,19 @@ class UploadStateStore:
         activity_id: int,
         warning: str = "",
     ) -> None:
+        """Record a finished upload with status ``completed``.
+
+        Used both for a genuinely new activity and for a recognized
+        duplicate, where `activity_id` is the pre-existing activity and
+        `warning` carries Strava's duplicate-detection message.
+
+        Args:
+            session_id: The canonical adidas session UUID that finished.
+            activity_id: The resulting (or pre-existing, for a duplicate)
+                Strava activity ID.
+            warning: An optional diagnostic message, truncated to 2000
+                characters and stored alongside the completed status.
+        """
         self._update(
             session_id,
             """
@@ -118,6 +191,12 @@ class UploadStateStore:
         )
 
     def mark_failed(self, session_id: str, error: str) -> None:
+        """Record a terminal failure with status ``failed``.
+
+        Args:
+            session_id: The canonical adidas session UUID that failed.
+            error: The failure message, truncated to 2000 characters.
+        """
         self._update(
             session_id,
             "status = 'failed', error_warning = ?",

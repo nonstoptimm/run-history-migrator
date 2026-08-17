@@ -13,19 +13,43 @@ from .models import CompanionFiles, Session, TimedValue, TrackPoint
 
 JOIN_TOLERANCE_MS = 5_000
 
+# Narrow shapes for the untyped JSON adidas exports: an object (keyed by
+# string) and a top-level array. `object` (not `Any`) is used for
+# values/elements so callers must explicitly narrow before use instead of
+# silently propagating an untyped value.
+type JSONObject = dict[str, object]
+type JSONArray = list[object]
+
 
 class ParseError(ValueError):
-    pass
+    """Raised when an adidas export file is missing, unreadable, or malformed."""
 
 
-def _feature_attributes(data: dict, feature_type: str) -> dict:
-    features = data.get("features")
-    if not isinstance(features, list):
+def _as_object(value: object) -> JSONObject | None:
+    """Narrow `value` to a JSON object mapping, or `None` if it is not one."""
+    return value if isinstance(value, dict) else None
+
+
+def _as_array(value: object) -> JSONArray | None:
+    """Narrow `value` to a JSON array, or `None` if it is not one."""
+    return value if isinstance(value, list) else None
+
+
+def _feature_attributes(data: JSONObject, feature_type: str) -> JSONObject:
+    """Return the ``attributes`` mapping of the first feature block matching `feature_type`.
+
+    adidas session JSON nests optional/legacy fields inside a top-level
+    ``features`` array of typed blocks (for example ``"initial_values"``
+    or ``"track_metrics"``); this looks up the first block by its
+    ``type`` value.
+    """
+    features = _as_array(data.get("features"))
+    if features is None:
         return {}
     for feature in features:
-        if isinstance(feature, dict) and feature.get("type") == feature_type:
-            attributes = feature.get("attributes")
-            return attributes if isinstance(attributes, dict) else {}
+        feature_obj = _as_object(feature)
+        if feature_obj is not None and feature_obj.get("type") == feature_type:
+            return _as_object(feature_obj.get("attributes")) or {}
     return {}
 
 
@@ -49,11 +73,25 @@ def _integer(value: object, default: int = 0) -> int:
 
 
 def parse_session(path: Path) -> Session:
+    """Parse one adidas session JSON file into a `Session`.
+
+    Args:
+        path: Path to the session JSON file.
+
+    Returns:
+        The parsed `Session`.
+
+    Raises:
+        ParseError: If the file cannot be read, is not valid JSON, is not
+            a JSON object, or is missing a required field (canonical
+            session ID, start time, or sport type ID).
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ParseError(f"cannot read session JSON: {exc}") from exc
-    if not isinstance(data, dict):
+    data = _as_object(raw)
+    if data is None:
         raise ParseError("session JSON is not an object")
 
     initial = _feature_attributes(data, "initial_values")
@@ -67,8 +105,8 @@ def parse_session(path: Path) -> Session:
         raise ParseError("missing or invalid start_time")
     sport_type_id = data.get("sport_type_id")
     if sport_type_id is None:
-        sport = initial.get("sport_type")
-        sport_type_id = sport.get("id") if isinstance(sport, dict) else None
+        sport = _as_object(initial.get("sport_type"))
+        sport_type_id = sport.get("id") if sport is not None else None
     if sport_type_id is None:
         raise ParseError("missing sport type id")
 
@@ -89,10 +127,17 @@ def parse_session(path: Path) -> Session:
 
 
 def scan_sessions(sport_sessions_dir: Path) -> list[Path]:
+    """Return every session JSON file directly under `sport_sessions_dir`, sorted by name."""
     return sorted(path for path in sport_sessions_dir.glob("*.json") if path.is_file())
 
 
 def _id_from_companion_filename(path: Path) -> str | None:
+    """Return the canonical session ID suffix of a companion filename, if present.
+
+    Companion files are named ``<arbitrary-prefix>_<session_id>.<ext>``;
+    this returns the part after the last underscore, or `None` if the
+    filename has no underscore or an empty suffix.
+    """
     if "_" not in path.stem:
         return None
     session_id = path.stem.rsplit("_", 1)[1]
@@ -100,6 +145,17 @@ def _id_from_companion_filename(path: Path) -> str | None:
 
 
 def index_companions(sport_sessions_dir: Path) -> dict[str, CompanionFiles]:
+    """Index each session's companion GPS/heart-rate/elevation files by session ID.
+
+    Args:
+        sport_sessions_dir: The adidas export's `Sport-sessions` directory.
+
+    Returns:
+        A mapping of canonical session ID to the `CompanionFiles` found
+        for it. Sessions with no companion files at all are omitted. When
+        multiple files match the same session and field, the
+        lexicographically first path (by sorted glob order) wins.
+    """
     indexed: dict[str, dict[str, Path]] = {}
     locations = (
         ("GPS-data", "*.json", "gps_json"),
@@ -115,21 +171,50 @@ def index_companions(sport_sessions_dir: Path) -> dict[str, CompanionFiles]:
     return {session_id: CompanionFiles(**paths) for session_id, paths in indexed.items()}
 
 
-def _load_array(path: Path, label: str) -> list:
+def _load_array(path: Path, label: str) -> JSONArray:
+    """Read and return a JSON file's top-level array.
+
+    Args:
+        path: Path to the JSON file.
+        label: Human-readable description used in error messages.
+
+    Raises:
+        ParseError: If the file cannot be read, is not valid JSON, or its
+            top-level value is not a JSON array.
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ParseError(f"cannot read {label}: {exc}") from exc
-    if not isinstance(data, list):
+    data = _as_array(raw)
+    if data is None:
         raise ParseError(f"{label} is not a JSON array")
     return data
 
 
 def parse_gps_json(path: Path) -> tuple[list[TrackPoint], list[str]]:
+    """Parse an adidas GPS JSON stream into timestamp-sorted track points.
+
+    Rows that are not JSON objects, or have a missing/invalid timestamp
+    or out-of-range latitude/longitude, are dropped and reported as
+    warnings. Other rows are kept even when altitude/distance are
+    missing or invalid (those fields simply become `None`).
+
+    Args:
+        path: Path to the GPS JSON file.
+
+    Returns:
+        A tuple of the parsed, timestamp-sorted track points and any
+        non-fatal per-row warnings.
+
+    Raises:
+        ParseError: If the file cannot be read or is not a JSON array.
+    """
     points: list[TrackPoint] = []
     warnings: list[str] = []
-    for index, row in enumerate(_load_array(path, "GPS JSON")):
-        if not isinstance(row, dict):
+    for index, raw_row in enumerate(_load_array(path, "GPS JSON")):
+        row = _as_object(raw_row)
+        if row is None:
             warnings.append(f"GPS row {index} is not an object")
             continue
         timestamp = _integer(row.get("timestamp"), -1)
@@ -158,6 +243,23 @@ def _local_name(tag: str) -> str:
 
 
 def parse_gpx(path: Path) -> tuple[list[TrackPoint], list[str]]:
+    """Parse a GPX 1.1 track into timestamp-sorted track points.
+
+    Only `<trkpt>` elements are considered. A point is dropped (with a
+    warning) if its `lat`/`lon` attributes are missing/invalid or if it
+    has no valid `<time>` child; `<ele>` and `<hr>` children are optional
+    and populate `altitude_m`/`heart_rate` when present and valid.
+
+    Args:
+        path: Path to the GPX file.
+
+    Returns:
+        A tuple of the parsed, timestamp-sorted track points and any
+        non-fatal per-point warnings.
+
+    Raises:
+        ParseError: If the file cannot be read or is not well-formed XML.
+    """
     from datetime import datetime
 
     warnings: list[str] = []
@@ -209,10 +311,28 @@ def parse_gpx(path: Path) -> tuple[list[TrackPoint], list[str]]:
 
 
 def parse_heart_rate(path: Path) -> tuple[list[TimedValue], list[str]]:
+    """Parse a separate adidas heart-rate JSON stream into timestamped values.
+
+    Rows that are not JSON objects are reported as warnings. Rows with a
+    missing/invalid timestamp or a non-positive heart rate are silently
+    dropped (not warned), matching this stream's existing tolerance for
+    sparse/partial companion data.
+
+    Args:
+        path: Path to the heart-rate JSON file.
+
+    Returns:
+        A tuple of the parsed, timestamp-sorted values and any per-row
+        warnings.
+
+    Raises:
+        ParseError: If the file cannot be read or is not a JSON array.
+    """
     values: list[TimedValue] = []
     warnings: list[str] = []
-    for index, row in enumerate(_load_array(path, "heart-rate JSON")):
-        if not isinstance(row, dict):
+    for index, raw_row in enumerate(_load_array(path, "heart-rate JSON")):
+        row = _as_object(raw_row)
+        if row is None:
             warnings.append(f"HR row {index} is not an object")
             continue
         timestamp = _integer(row.get("timestamp"), -1)
@@ -225,10 +345,28 @@ def parse_heart_rate(path: Path) -> tuple[list[TimedValue], list[str]]:
 
 
 def parse_elevation(path: Path) -> tuple[list[TimedValue], list[str]]:
+    """Parse a separate adidas elevation JSON stream into timestamped values.
+
+    Rows that are not JSON objects are reported as warnings. Rows with a
+    missing/invalid timestamp or a non-finite elevation are silently
+    dropped (not warned), matching this stream's existing tolerance for
+    sparse/partial companion data.
+
+    Args:
+        path: Path to the elevation JSON file.
+
+    Returns:
+        A tuple of the parsed, timestamp-sorted values and any per-row
+        warnings.
+
+    Raises:
+        ParseError: If the file cannot be read or is not a JSON array.
+    """
     values: list[TimedValue] = []
     warnings: list[str] = []
-    for index, row in enumerate(_load_array(path, "elevation JSON")):
-        if not isinstance(row, dict):
+    for index, raw_row in enumerate(_load_array(path, "elevation JSON")):
+        row = _as_object(raw_row)
+        if row is None:
             warnings.append(f"elevation row {index} is not an object")
             continue
         timestamp = _integer(row.get("timestamp"), -1)
@@ -241,6 +379,12 @@ def parse_elevation(path: Path) -> tuple[list[TimedValue], list[str]]:
 
 
 def _nearest(values: list[TimedValue], timestamp_ms: int) -> TimedValue | None:
+    """Return the value in `values` closest to `timestamp_ms`, within `JOIN_TOLERANCE_MS`.
+
+    `values` must already be sorted by `timestamp_ms`. Returns `None` if
+    `values` is empty or the closest candidate is farther than
+    `JOIN_TOLERANCE_MS` away.
+    """
     if not values:
         return None
     timestamps = [item.timestamp_ms for item in values]
@@ -257,6 +401,23 @@ def merge_measurements(
     heart_rate: list[TimedValue],
     elevation: list[TimedValue],
 ) -> list[TrackPoint]:
+    """Join separate heart-rate/elevation streams onto GPS track points.
+
+    For each point, the nearest heart-rate and elevation sample within
+    `JOIN_TOLERANCE_MS` (5 seconds) is used to fill in `heart_rate` and
+    `altitude_m` respectively, falling back to the point's own values
+    (from the GPS stream) when no sample is close enough or the stream is
+    empty.
+
+    Args:
+        points: GPS track points to enrich, in any order.
+        heart_rate: Timestamp-sorted heart-rate samples to join.
+        elevation: Timestamp-sorted elevation samples to join.
+
+    Returns:
+        A new list of track points, one per input point and in the same
+        order, with `heart_rate`/`altitude_m` filled in where possible.
+    """
     merged: list[TrackPoint] = []
     for point in points:
         hr = _nearest(heart_rate, point.timestamp_ms)

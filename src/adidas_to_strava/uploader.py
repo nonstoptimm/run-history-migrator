@@ -8,19 +8,56 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Protocol
 
 from .filters import DateRange, select_activities
 from .manifest import load_upload_candidates
-from .models import UploadCandidate
-from .strava_client import StravaAPIError, StravaClient, StravaRateLimitError, UploadStatus
+from .models import UploadCandidate, UploadRecord
+from .strava_client import StravaAPIError, StravaRateLimitError, UploadStatus
 from .tcx import validate_tcx
 from .upload_state import UploadStateStore
 
 DUPLICATE_ACTIVITY_PATTERN = re.compile(r"/activities/(\d+)")
 
 
+class UploadClient(Protocol):
+    """The two asynchronous upload operations `upload_activities` needs.
+
+    `StravaClient` satisfies this protocol directly; tests may supply a
+    minimal fake implementing only these two methods instead of a full
+    Strava client.
+    """
+
+    def submit_upload(self, tcx_path: Path, *, external_id: str) -> UploadStatus:
+        """Submit one TCX file and return Strava's asynchronous upload record."""
+        ...
+
+    def get_upload_status(self, upload_id: int) -> UploadStatus:
+        """Retrieve the current asynchronous upload-processing state."""
+        ...
+
+
 @dataclass
 class UploadSummary:
+    """Aggregate counts for one `upload_activities` run.
+
+    Attributes:
+        selected: Activities chosen for this run after filtering and
+            skipping already-completed sessions (subject to `limit`).
+        validated: Selected activities whose TCX file passed validation.
+        dry_run: Validated activities that were reported as upload-ready
+            without contacting Strava, because `dry_run` was ``True``.
+        submitted: Activities newly submitted to Strava in this run
+            (excludes resumed submissions and dry runs).
+        completed: Activities that reached a Strava activity ID, whether
+            newly created, resumed, or reconciled as a duplicate.
+        skipped_completed: Activities skipped because they were already
+            marked completed (or recognizable duplicates) and `force` was
+            not set.
+        failed: Activities that failed TCX validation, failed to upload,
+            or did not finish processing within `max_polls`.
+    """
+
     selected: int = 0
     validated: int = 0
     dry_run: int = 0
@@ -33,7 +70,7 @@ class UploadSummary:
 def upload_activities(
     output_dir: Path,
     *,
-    client: StravaClient | None,
+    client: UploadClient | None,
     since: date | None,
     until: date | None,
     sport: str,
@@ -45,7 +82,55 @@ def upload_activities(
     sleep: Callable[[float], None] = time.sleep,
     progress: Callable[[str], None] = print,
 ) -> UploadSummary:
-    """Validate, submit, poll, and persist selected converted activities."""
+    """Validate, submit, poll, and persist selected converted activities.
+
+    In a dry run, no SQLite database is created or written and `client` is
+    never called: activities are only validated and reported as upload
+    ready. Otherwise, each selected activity is validated, submitted (or
+    resumed from a prior interrupted attempt), and polled until Strava
+    finishes processing it or `max_polls` is reached; every state
+    transition is persisted via `UploadStateStore` so a later run can
+    resume or skip it.
+
+    A session already marked completed, or whose last recorded error is a
+    recognizable Strava duplicate-upload message, is skipped without
+    calling Strava again unless `force` is ``True``. When `force` is
+    ``True``, such sessions are resubmitted from scratch, which may create
+    duplicate Strava activities.
+
+    Args:
+        output_dir: The conversion output directory containing
+            `manifest.csv`, the TCX files it references, and (unless
+            `dry_run`) the `upload-state.sqlite3` state database.
+        client: The Strava client used to submit and poll uploads;
+            required unless `dry_run` is ``True``.
+        since: The earliest local calendar date to include, inclusive.
+        until: The latest local calendar date to include, inclusive.
+        sport: The adidas sport to select; see `filters.validate_sport`.
+        limit: The maximum number of actionable (not already completed)
+            activities to process, or ``None`` for no limit.
+        dry_run: Whether to only validate and report readiness, without
+            touching Strava or the state database.
+        force: Whether to resubmit sessions already marked completed or
+            recognized as duplicates, instead of skipping them.
+        poll_interval: The number of seconds to `sleep` between polls of
+            an in-progress upload.
+        max_polls: The maximum number of status polls per activity before
+            giving up and leaving it resumable.
+        sleep: The delay function called between polls; injectable for
+            tests.
+        progress: The callback used to report per-activity progress lines.
+
+    Returns:
+        Aggregate counts for this run.
+
+    Raises:
+        ValueError: If a non-dry-run activity needs uploading but `client`
+            is ``None``.
+        StravaRateLimitError: If Strava's rate limit is exhausted; raised
+            immediately so the caller can stop the whole run rather than
+            continue burning through remaining activities.
+    """
     eligible = select_activities(
         load_upload_candidates(output_dir),
         DateRange(since, until),
@@ -136,13 +221,37 @@ def upload_activities(
 
 def _submit_or_resume(
     candidate: UploadCandidate,
-    record,
-    client: StravaClient,
+    record: UploadRecord | None,
+    client: UploadClient,
     store: UploadStateStore,
     force: bool,
     prefix: str,
     progress: Callable[[str], None],
 ) -> UploadStatus:
+    """Resume a previously submitted upload, or submit a new one.
+
+    A prior `record` is resumed (polling its existing Strava upload ID
+    instead of submitting again) only when it is still `"submitted"` or
+    `"processing"` and `force` is ``False``; otherwise a new submission is
+    started, which also handles a duplicate-upload error by reconciling it
+    as completed rather than treating it as a failure.
+
+    Args:
+        candidate: The activity being submitted or resumed.
+        record: The previously persisted state for this session, if any.
+        client: The upload client used to submit or poll.
+        store: The state store to update as progress is made.
+        force: Whether to force a fresh submission instead of resuming.
+        prefix: The per-activity line prefix used in `progress` messages.
+        progress: The callback used to report progress lines.
+
+    Returns:
+        The resulting or resumed upload status.
+
+    Raises:
+        StravaAPIError: If Strava reports a non-duplicate error for a new
+            submission.
+    """
     if (
         record
         and record.strava_upload_id
@@ -184,7 +293,7 @@ def _submit_or_resume(
 def _poll(
     candidate: UploadCandidate,
     initial: UploadStatus,
-    client: StravaClient,
+    client: UploadClient,
     store: UploadStateStore,
     prefix: str,
     progress: Callable[[str], None],
@@ -192,6 +301,29 @@ def _poll(
     max_polls: int,
     sleep: Callable[[float], None],
 ) -> UploadStatus:
+    """Poll an in-progress upload until it finishes or `max_polls` is reached.
+
+    Each poll's status is persisted as `"processing"` before sleeping, so
+    an interruption mid-poll leaves the upload resumable by a later run.
+    Reaching `max_polls` without a result is treated the same way: the
+    activity is left `"processing"` (not `"failed"`) so it can be resumed.
+
+    Args:
+        candidate: The activity being polled.
+        initial: The status returned by the initiating submission or
+            resume, polled from here.
+        client: The upload client used to poll.
+        store: The state store to update as progress is made.
+        prefix: The per-activity line prefix used in `progress` messages.
+        progress: The callback used to report progress lines.
+        poll_interval: The number of seconds to `sleep` between polls.
+        max_polls: The maximum number of polls before giving up.
+        sleep: The delay function called between polls.
+
+    Returns:
+        The final upload status: completed (possibly via duplicate
+        reconciliation), failed, or still processing after `max_polls`.
+    """
     status = initial
     for poll_number in range(max_polls):
         if status.error:
@@ -236,7 +368,15 @@ def _duplicate_activity_id(error: str) -> int | None:
 
 
 def format_upload_summary(summary: UploadSummary) -> str:
-    """Render upload totals."""
+    """Render upload totals as CLI-visible, human-readable text.
+
+    Args:
+        summary: The counts to render.
+
+    Returns:
+        One label-and-count line per `UploadSummary` field, in a stable
+        order, joined with newlines.
+    """
     return "\n".join(
         (
             f"Selected: {summary.selected}",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import TypedDict, Unpack
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -12,17 +14,24 @@ from adidas_to_strava.strava_client import StravaAuthError, StravaClient
 from .helpers import FakeResponse, FakeSession
 
 
-def settings(tmp_path, **overrides) -> StravaSettings:
-    values = {
-        "client_id": "1234",
-        "client_secret": "client-secret-value",
-        "access_token": None,
-        "refresh_token": None,
-        "token_expires_at": None,
-        "env_path": tmp_path / ".env",
-    }
-    values.update(overrides)
-    return StravaSettings(**values)
+class SettingsOverrides(TypedDict, total=False):
+    client_id: str
+    client_secret: str
+    access_token: str | None
+    refresh_token: str | None
+    token_expires_at: int | None
+    env_path: Path
+
+
+def settings(tmp_path: Path, **overrides: Unpack[SettingsOverrides]) -> StravaSettings:
+    return StravaSettings(
+        client_id=overrides.get("client_id", "1234"),
+        client_secret=overrides.get("client_secret", "client-secret-value"),
+        access_token=overrides.get("access_token"),
+        refresh_token=overrides.get("refresh_token"),
+        token_expires_at=overrides.get("token_expires_at"),
+        env_path=overrides.get("env_path", tmp_path / ".env"),
+    )
 
 
 def test_authorization_url_contains_required_scopes_and_state() -> None:
@@ -33,7 +42,7 @@ def test_authorization_url_contains_required_scopes_and_state() -> None:
     assert query["response_type"] == ["code"]
 
 
-def test_token_exchange_and_persistence(tmp_path) -> None:
+def test_token_exchange_and_persistence(tmp_path: Path) -> None:
     fake = FakeSession(
         posts=[
             FakeResponse(
@@ -56,7 +65,7 @@ def test_token_exchange_and_persistence(tmp_path) -> None:
     assert "one-use-code" not in contents
 
 
-def test_missing_required_scope_is_rejected_before_persistence(tmp_path) -> None:
+def test_missing_required_scope_is_rejected_before_persistence(tmp_path: Path) -> None:
     fake = FakeSession(
         posts=[
             FakeResponse(
@@ -76,7 +85,7 @@ def test_missing_required_scope_is_rejected_before_persistence(tmp_path) -> None
     assert not (tmp_path / ".env").exists()
 
 
-def test_valid_token_reused_without_request(tmp_path) -> None:
+def test_valid_token_reused_without_request(tmp_path: Path) -> None:
     fake = FakeSession()
     client = StravaClient(
         settings(tmp_path, access_token="valid", token_expires_at=10_000),
@@ -87,7 +96,7 @@ def test_valid_token_reused_without_request(tmp_path) -> None:
     assert fake.post_calls == []
 
 
-def test_expired_token_refreshes_and_rotates(tmp_path) -> None:
+def test_expired_token_refreshes_and_rotates(tmp_path: Path) -> None:
     fake = FakeSession(
         posts=[
             FakeResponse(
@@ -114,8 +123,8 @@ def test_expired_token_refreshes_and_rotates(tmp_path) -> None:
     assert "rotated-refresh" in (tmp_path / ".env").read_text()
 
 
-def test_token_refresh_retries_transient_server_failure(tmp_path) -> None:
-    sleeps = []
+def test_token_refresh_retries_transient_server_failure(tmp_path: Path) -> None:
+    sleeps: list[float] = []
     fake = FakeSession(
         posts=[
             FakeResponse(503, {"message": "temporary"}),
@@ -139,7 +148,10 @@ def test_token_refresh_retries_transient_server_failure(tmp_path) -> None:
     assert len(sleeps) == 1
 
 
-def test_refresh_failure_does_not_log_secrets(tmp_path, caplog) -> None:
+def test_refresh_failure_does_not_log_secrets(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     fake = FakeSession(posts=[FakeResponse(401, {"message": "bad credentials"})])
     secret = "never-log-this-secret"
     client = StravaClient(
@@ -158,7 +170,10 @@ def test_refresh_failure_does_not_log_secrets(tmp_path, caplog) -> None:
     assert "private-refresh" not in caplog.text
 
 
-def test_load_settings_validates_required_values(tmp_path, monkeypatch) -> None:
+def test_load_settings_validates_required_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for key in (
         "STRAVA_CLIENT_ID",
         "STRAVA_CLIENT_SECRET",

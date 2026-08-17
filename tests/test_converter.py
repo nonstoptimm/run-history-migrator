@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import xml.etree.ElementTree as ET
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +17,7 @@ from adidas_to_strava.tcx import TCX_NS, output_filename, utc_timestamp, validat
 from .helpers import make_export, write_gps, write_session
 
 
-def test_epoch_ms_utc_and_local_calendar_date(tmp_path) -> None:
+def test_epoch_ms_utc_and_local_calendar_date(tmp_path: Path) -> None:
     _, sessions = make_export(tmp_path)
     session = parse_session(
         write_session(
@@ -31,7 +32,7 @@ def test_epoch_ms_utc_and_local_calendar_date(tmp_path) -> None:
     assert output_filename(session) == "2023-01-01_010000_1.00km_aaaaaaaa.tcx"
 
 
-def test_inclusive_since_until_and_no_default_filter(tmp_path) -> None:
+def test_inclusive_since_until_and_no_default_filter(tmp_path: Path) -> None:
     export, sessions = make_export(tmp_path)
     for session_id, start_ms in (
         ("before", 1_672_444_800_000),
@@ -61,7 +62,7 @@ def test_invalid_date_range() -> None:
         DateRange(date(2024, 1, 2), date(2024, 1, 1))
 
 
-def test_cli_rejects_invalid_date_range(tmp_path) -> None:
+def test_cli_rejects_invalid_date_range(tmp_path: Path) -> None:
     export, _ = make_export(tmp_path)
     with pytest.raises(SystemExit):
         main(
@@ -76,7 +77,7 @@ def test_cli_rejects_invalid_date_range(tmp_path) -> None:
         )
 
 
-def test_running_filter_uuid_matching_and_malformed_input(tmp_path) -> None:
+def test_running_filter_uuid_matching_and_malformed_input(tmp_path: Path) -> None:
     export, sessions = make_export(tmp_path)
     write_session(sessions, "running")
     gps = write_gps(sessions, "running")
@@ -90,7 +91,7 @@ def test_running_filter_uuid_matching_and_malformed_input(tmp_path) -> None:
     assert summary.malformed_sessions == 1
 
 
-def test_tcx_missing_optional_streams_manifest_and_duplicates(tmp_path) -> None:
+def test_tcx_missing_optional_streams_manifest_and_duplicates(tmp_path: Path) -> None:
     export, sessions = make_export(tmp_path)
     session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     write_session(sessions, session_id)
@@ -114,7 +115,7 @@ def test_tcx_missing_optional_streams_manifest_and_duplicates(tmp_path) -> None:
     assert row["local_start_date"] == "2023-01-01"
 
 
-def test_missing_gps_dry_run_and_inspect_are_read_only(tmp_path) -> None:
+def test_missing_gps_dry_run_and_inspect_are_read_only(tmp_path: Path) -> None:
     export, sessions = make_export(tmp_path)
     write_session(sessions, "no-gps")
     output = tmp_path / "not-created"
@@ -126,7 +127,7 @@ def test_missing_gps_dry_run_and_inspect_are_read_only(tmp_path) -> None:
     assert not output.exists()
 
 
-def test_validate_tcx_rejects_malformed_xml(tmp_path) -> None:
+def test_validate_tcx_rejects_malformed_xml(tmp_path: Path) -> None:
     path = tmp_path / "broken.tcx"
     path.write_text("<broken>", encoding="utf-8")
     with pytest.raises(ValueError, match="invalid TCX"):

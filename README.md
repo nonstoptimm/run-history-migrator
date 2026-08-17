@@ -1,395 +1,270 @@
 # adidas-to-strava
 
-Convert an adidas Running / Runtastic data export into standards-compliant TCX
-files and, optionally, upload them to a private Strava account through the
-official Strava API.
+Convert a historical adidas Running / Runtastic data export into TCX files
+you can put on Strava — either by hand through
+Strava's own upload page, or, optionally, through Strava's official API using
+this tool's built-in, resumable uploader.
+
+## So what
+
+If you've ever tried to drag an adidas Running export straight into Strava,
+it doesn't work — the data is split across several JSON files per run, and
+Strava has no idea how to read them. This tool joins those files back into
+one TCX per run, locally, with nothing sent anywhere unless you explicitly
+choose the API upload path. You end up with a folder of TCX v2 files
+plus a manifest you can check before uploading anything, and — if you want
+it — a duplicate-safe, resumable way to push them to Strava via its API.
+
+## Who this is for
+
+- Runners moving years of adidas Running / Runtastic history to Strava once,
+  as a one-time migration.
+- People who want to inspect and verify their data locally before anything
+  touches Strava.
+- Anyone comfortable running a couple of commands in a terminal.
+
+## Who this isn't for
+
+- Non-running activities — only running is currently supported (see
+  [Limitations](#limitations)).
+- Ongoing/continuous sync between adidas and Strava — this is a one-time
+  conversion tool, not a background sync service.
+- Anyone needing a no-terminal, point-and-click GUI.
+
+## Why conversion is needed
+
+adidas Running historically ran on Runtastic's infrastructure. Its data
+export stores each run's metadata separately from its GPS, heart-rate, and
+elevation streams, in adidas/Runtastic's own JSON shape — not a format Strava
+imports directly. This tool reads those files, joins them back together by
+each run's canonical session ID, and writes one TCX file per eligible run for
+inspection and upload.
+
+## How it works
 
 ```text
-adidas Running / Runtastic export
-        |
-        v
-parse + join session data
-        |
-        v
-local TCX files + conversion manifest
-        |
-        v
-optional, resumable Strava API upload
+1. Locate your adidas/Runtastic export folder
+2. inspect it (read-only) to see what's eligible
+3. convert eligible runs into local TCX files + a manifest
+4. spot-check one converted file before trusting the rest
+5. upload — by hand on strava.com, or via this tool's optional API uploader
 ```
 
-## Why this exists
+## Two ways to get activities onto Strava
 
-adidas Running historically used Runtastic infrastructure. Its data export
-stores activity metadata separately from GPS, heart-rate, and elevation
-streams. Strava does not directly import those adidas JSON files.
+Both start from the same local `convert` step. Pick one for the upload
+itself.
 
-This project joins the streams by canonical adidas session ID, writes one TCX
-file per activity, and can upload validated TCX files through Strava's
-asynchronous activity upload API.
+### A — Manual, through Strava's web portal
 
-## Privacy and safety
+Convert locally, then upload the resulting `.tcx` files yourself through
+Strava's own bulk uploader. No Strava API application, no OAuth, no tokens.
 
-- Conversion is local-first and does not require Strava credentials.
-- Uploading is optional and uses the official API, not website scraping.
-- `upload --dry-run` performs no API requests, token refreshes, or state writes.
-- Successful uploads are recorded locally and skipped on later runs.
-- Tokens are stored only in an ignored local `.env`.
-- The tool never intentionally logs tokens, client secrets, or OAuth codes.
+### B — Optional, API-assisted upload
 
-Never commit or share:
+Create a small personal Strava API application once, authorize this CLI, and
+let it submit TCX files through Strava's official asynchronous upload API —
+tracking state locally so reruns skip known completions, resume known
+in-flight uploads, and reconcile duplicate responses that include a
+recognizable existing activity ID.
 
-```text
-.env
-Client Secret
-Access Token
-Refresh Token
-OAuth authorization codes
-```
+| Situation | Recommended path |
+|---|---|
+| A handful of runs, doing this once | **A** — manual portal upload |
+| Don't want to create a Strava API app | **A** — manual portal upload |
+| Hundreds of historical runs | **B** — API-assisted, resumable |
+| Want local completion tracking and resumable retries | **B** — API-assisted |
+| No browser available for an OAuth callback | **A**, or **B** with `--no-browser` and manual code entry |
 
-## Supported activities
+Full setup for path B lives in [Strava API setup](docs/strava-api-setup.md).
 
-Running is currently the only supported sport. It maps explicitly to
-adidas/Runtastic sport type ID `1`. Other sports are rejected rather than
-silently treated as running.
+## Safety model: test one run first
 
-## Supported export structure
+Every step below is safe to run repeatedly and cheap to undo:
 
-```text
-export-YYYYMMDD-NNN/
-└── Sport-sessions/
-    ├── YYYY-MM-DD_HH-MM-SS-UTC_SESSION-ID.json
-    ├── GPS-data/
-    │   ├── ...SESSION-ID.json
-    │   └── ...SESSION-ID.gpx
-    ├── Heart-rate-data/
-    │   └── ...SESSION-ID.json
-    └── Elevation-data/
-        └── ...SESSION-ID.json
-```
+1. `inspect` — read-only; reports session metadata and matching companion-file
+   presence without parsing every stream.
+2. `convert --dry-run` — writes nothing; parses selected sessions unless an
+   existing output/manifest row causes the normal duplicate bypass.
+3. `convert --session-id <uuid>` (or `--limit 1`) — selects at most one run;
+   it may write no TCX if that run is already present or has no usable GPS.
+4. Open that one TCX (or check `manifest.csv`) before trusting the rest.
+5. Only then run a full conversion.
 
-adidas and Runtastic filenames vary between export generations. The converter:
+For the API upload path specifically, repeat the same idea before touching
+Strava: `upload --dry-run` (zero API calls) → `upload --limit 1` (attempt one
+actionable candidate) → verify any resulting activity on strava.com → then
+drop `--limit`.
 
-- scans only top-level `Sport-sessions/*.json` metadata files
-- uses the session's `id` as the canonical companion-stream key
-- prefers timestamped GPS JSON and falls back to timestamped GPX
-- joins optional heart rate and elevation by nearby source timestamps
-- never fabricates trackpoints or timestamps
-- skips activities with no usable timestamped GPS track
+## Data fidelity
+
+| Data | Carries over? | Notes |
+|---|---|---|
+| GPS track | If present | JSON preferred, GPX fallback; skipped if neither has a usable timestamped track |
+| Distance, duration | Yes | From the source session; pauses show as timestamp gaps, never interpolated |
+| Heart rate | If present in export | Missing HR still converts fine; Strava features derived from HR may be unavailable |
+| Elevation | If present in export | Falls back to inline GPS/GPX altitude when there's no separate elevation stream |
+| Calories | If present at session top level | Uses the top-level session value; otherwise writes `0` |
+| Activity type | Running only | Always written as Running |
+| Segments, best efforts | No | Strava computes these itself after import |
+| adidas challenges, groups, equipment | No | Not part of the data streams this tool reads |
+
+This is not a claim of exact equivalence with the original adidas activity —
+see [Limitations](#limitations) and [adidas export format](docs/adidas-export-format.md#fidelity-honestly).
+
+## Recommended workflow
+
+1. Install (see below).
+2. `inspect` your export — read-only, inventories eligible metadata and
+   companion-file presence.
+3. `convert --dry-run` — previews selection and parses non-duplicate
+   candidates without writing.
+4. `convert --session-id <uuid>` — attempt one TCX and check it if written.
+5. `convert` (full range) — write everything.
+6. Check `manifest.csv` for `skipped_no_gps`/`error` rows.
+7. Upload: manually on strava.com, **or** `upload --dry-run` →
+   `upload --limit 1` → verify → `upload` (no `--limit`).
+
+The full step-by-step, with every command shown, is in the
+[migration guide](docs/migration-guide.md).
+
+## Commands
+
+| Command | Purpose | Key flags |
+|---|---|---|
+| `inspect` | Read-only look at what's eligible | `export_path`, `--since`, `--until`, `--sport running`, `--limit`, `--session-id`, `--verbose` |
+| `convert` | Write TCX files + `manifest.csv` | selection flags, plus `--output`, `--dry-run`, `--overwrite`; see the guide for ordering |
+| `auth` | One-time Strava OAuth (path B only) | `--env-file`, `--code`, `--port`, `--timeout`, `--no-browser`, `--verbose` |
+| `upload` | Submit converted TCX to Strava (path B only) | `output_dir`, `--since`, `--until`, `--sport running`, `--limit`, `--dry-run`, `--force`, `--env-file`, `--verbose` |
+
+`upload` has **no** `--session-id` — use `--limit 1` for single-activity
+control. Full flag reference: [migration guide](docs/migration-guide.md#exact-cli-reference).
 
 ## Requirements and installation
 
-Python 3.12 or newer is required.
+Python 3.12 or newer.
 
 ```bash
 git clone <repository-url>
 cd adidas-to-strava
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
+python3 -m pip install -e '.[dev]'
 ```
 
-Development tools:
+Drop `[dev]` (`python3 -m pip install -e .`) if you don't need the test/lint
+tooling. All examples below assume the virtual environment is active.
+
+## A concrete case
+
+Jordan has three years of adidas Running history — about 600 runs — and
+wants them on Strava without re-running anything or trusting a bulk import
+blindly.
 
 ```bash
-python -m pip install -e '.[dev]'
+# 1. See what's there, no files written
+python3 -m adidas_to_strava inspect ~/Downloads/export-20260813-000 --sport running
+
+# 2. Narrow to the years that matter, still read-only
+python3 -m adidas_to_strava inspect ~/Downloads/export-20260813-000 \
+  --since 2023-01-01 --until 2026-08-13 --sport running
+
+# 3. Dry-run the conversion for that range
+python3 -m adidas_to_strava convert ~/Downloads/export-20260813-000 \
+  --since 2023-01-01 --until 2026-08-13 --sport running --output ./output --dry-run
+
+# 4. Convert just one known run and check the TCX by hand
+python3 -m adidas_to_strava convert ~/Downloads/export-20260813-000 \
+  --session-id 9490f545-63f9-4b34-bc46-7589427f3eb8 --output ./output
+
+# 5. Convert everything in range
+python3 -m adidas_to_strava convert ~/Downloads/export-20260813-000 \
+  --since 2023-01-01 --until 2026-08-13 --sport running --output ./output
 ```
 
-All examples below assume the virtual environment is active. You can also use
-`python -m adidas_to_strava` directly with an appropriate `PYTHONPATH`.
-
-## Inspect an export
-
-Inspect reads and filters the export without creating files:
+Jordan skims `output/manifest.csv`, sees a handful of early runs marked
+`skipped_no_gps` (adidas never recorded a GPS track for those), and accepts
+that. For the upload, Jordan sets up a personal Strava API app once (see
+[Strava API setup](docs/strava-api-setup.md)), then:
 
 ```bash
-python -m adidas_to_strava inspect \
-  ~/Downloads/export-20260813-000 \
-  --since 2023-01-01 \
-  --until 2026-08-13 \
-  --sport running
+python3 -m adidas_to_strava auth
+
+python3 -m adidas_to_strava upload ./output \
+  --since 2023-01-01 --until 2026-08-13 --sport running --limit 1 --dry-run --verbose
+
+python3 -m adidas_to_strava upload ./output \
+  --since 2023-01-01 --until 2026-08-13 --sport running --limit 1 --verbose
 ```
 
-## Date filtering
-
-Both date flags are optional:
-
-- `--since YYYY-MM-DD`: include activities on or after the date
-- `--until YYYY-MM-DD`: include activities on or before the date
-
-Both boundaries are inclusive. Dates use the activity's local calendar date,
-calculated from its actual session `start_time` and exported timezone offset.
-Filenames are not used as the authoritative date. Supplying no date flags
-means no date filtering. A range where `--since` is later than `--until` is
-rejected.
-
-## Convert to TCX
-
-Start with a dry run:
-
-```bash
-python -m adidas_to_strava convert \
-  ~/Downloads/export-20260813-000 \
-  --since 2023-01-01 \
-  --until 2026-08-13 \
-  --sport running \
-  --output ./output \
-  --dry-run
-```
-
-Then create the TCX files:
-
-```bash
-python -m adidas_to_strava convert \
-  ~/Downloads/export-20260813-000 \
-  --since 2023-01-01 \
-  --until 2026-08-13 \
-  --sport running \
-  --output ./output
-```
-
-Useful options:
-
-```text
---session-id UUID   select one known adidas session
---limit N           process only the first N eligible sessions
---overwrite         replace an existing TCX for the same session
---verbose           enable diagnostic logging
-```
-
-Single-session example:
-
-```bash
-python -m adidas_to_strava convert \
-  ~/Downloads/export-20260813-000 \
-  --session-id 9490f545-63f9-4b34-bc46-7589427f3eb8 \
-  --output ./output
-```
-
-## Conversion manifest
-
-`output/manifest.csv` connects every eligible adidas session to its source
-metadata, companion streams, output TCX, status, warning, timestamps, and local
-date. The canonical `session_id` remains available for duplicate-safe upload
-tracking.
-
-Existing TCX files are skipped unless `--overwrite` is supplied. A prior
-successful manifest record remains successful on a duplicate-safe rerun.
-
-## Create a private Strava API application
-
-1. Open Strava's API settings page: <https://www.strava.com/settings/api>
-2. Create an application for your personal migration.
-3. Set the callback domain to `localhost`.
-4. Copy `.env.example` to `.env`.
-5. Add the application's client ID and client secret:
-
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-
-```dotenv
-STRAVA_CLIENT_ID=your_client_id
-STRAVA_CLIENT_SECRET=your_client_secret
-STRAVA_ACCESS_TOKEN=
-STRAVA_REFRESH_TOKEN=
-STRAVA_TOKEN_EXPIRES_AT=
-```
-
-The requested scopes are the minimum used by this tool:
-
-```text
-read
-activity:write
-```
-
-## Authorize with Strava
-
-```bash
-python -m adidas_to_strava auth
-```
-
-The command prints the official authorization URL, opens it in your browser,
-and listens temporarily on `http://localhost:8765/callback`. If the callback
-cannot be captured, it asks for the returned authorization code or full
-callback URL.
-
-For manual exchange:
-
-```bash
-python -m adidas_to_strava auth --code ONE_USE_CODE
-```
-
-Access tokens expire after roughly six hours. Before a real API request the CLI
-refreshes an expired token using the latest refresh token. Strava refresh
-tokens rotate, so the CLI atomically updates `.env` with the newest access
-token, refresh token, and expiry.
-
-## Upload dry run
-
-Always inspect the upload selection first:
-
-```bash
-python -m adidas_to_strava upload ./output \
-  --since 2023-01-01 \
-  --until 2026-08-13 \
-  --sport running \
-  --limit 1 \
-  --dry-run \
-  --verbose
-```
-
-Dry-run validates the conversion manifest and TCX XML. It makes zero Strava
-requests and does not create upload state.
-
-## First safe upload: one activity
-
-After reviewing the dry run, upload exactly one activity:
-
-```bash
-python -m adidas_to_strava upload ./output \
-  --since 2023-01-01 \
-  --until 2026-08-13 \
-  --sport running \
-  --limit 1 \
-  --verbose
-```
-
-Verify the resulting activity in Strava before proceeding.
-
-## Bulk upload
-
-Only after the one-activity verification:
-
-```bash
-python -m adidas_to_strava upload ./output \
-  --since 2023-01-01 \
-  --until 2026-08-13 \
-  --sport running
-```
-
-Strava uploads are asynchronous. For each file the CLI submits the upload,
-persists its upload ID, polls at a conservative interval, records the resulting
-activity ID, and reports terminal processing errors.
-
-The uploader leaves the optional activity name unset so Strava applies its
-normal time-of-day activity naming. You can rename an activity in Strava later.
-
-## Resume and duplicate handling
-
-`output/upload-state.sqlite3` is a local SQLite database keyed by adidas
-session UUID. It records:
-
-- source TCX
-- attempt/submission/completion timestamps
-- Strava upload ID
-- Strava activity ID
-- lifecycle status
-- error or warning
-
-Completed sessions are skipped. Interrupted sessions that already have a
-Strava upload ID resume polling instead of submitting again.
-
-`--force` intentionally bypasses completed-state protection and may create a
-duplicate Strava activity. Use it only after investigating the existing state.
-
-## Rate limits and retries
-
-The default Strava application limits are currently:
-
-```text
-Overall: 200 requests / 15 minutes, 2,000 requests / day
-Read:    100 requests / 15 minutes, 1,000 requests / day
-```
-
-Runtime response headers are authoritative. The CLI tracks Strava's overall
-and read-limit headers, keeps a conservative reserve, and stops safely before
-exhaustion. HTTP 429 stops immediately. Daily exhaustion requires waiting until
-midnight UTC; short-term windows reset at natural 15-minute boundaries.
-
-Timeouts, connection failures, and selected transient server responses use
-bounded exponential backoff. Permanent client errors are not retried.
-
-## TCX behavior
-
-Generated TCX includes available:
-
-- Running activity type
-- UTC timestamps
-- GPS position
-- source distance
-- altitude/elevation
-- heart rate
-- calories
-- activity duration and total distance
-
-Pauses remain visible through source timestamp gaps. Missing heart rate or
-elevation does not prevent conversion. Strava may recalculate distance,
-elevation, moving time, pace, or related metrics after upload.
-
-## Troubleshooting
-
-**`No module named adidas_to_strava`**
-
-Activate the virtual environment after installing the project, or run from the
-project directory with:
-
-```bash
-PYTHONPATH=src python -m adidas_to_strava --help
-```
-
-**OAuth callback does not arrive**
-
-Confirm the Strava callback domain is `localhost`, check that port 8765 is
-available, or use the printed URL and paste the callback URL/code when
-prompted. A different port can be selected with `auth --port PORT`.
-
-**Activity is skipped as already uploaded**
-
-Inspect `output/upload-state.sqlite3`. Do not delete or use `--force` until you
-have verified whether the corresponding Strava activity exists.
-
-**Manifest path cannot be resolved**
-
-Keep `manifest.csv` with its generated TCX directory. Historical manifests
-that contain export-relative paths are supported when the project remains
-inside or beside the original export.
-
-## Security and revocation
-
-- Keep `.env` mode `600` on shared systems.
-- Never paste credentials into issues, commits, shell transcripts, or logs.
-- Rotate the client secret in Strava if it may have been exposed.
-- Revoke application access from Strava account settings when migration is
-  complete.
-- If the private app is no longer needed, delete it from
-  <https://www.strava.com/settings/api>.
-- Delete local `.env` and `upload-state.sqlite3` when you no longer need them.
+Only after checking that one activity on strava.com does Jordan drop
+`--limit` and let the rest upload, trusting that an interrupted run can be
+resumed by just running the same command again.
+
+## Privacy and security
+
+- Conversion is local-first; it never requires Strava credentials.
+- The optional upload path uses Strava's official API only — never website
+  scraping or an unofficial endpoint.
+- `upload --dry-run` makes zero API requests, refreshes no token, and writes
+  no upload state.
+- A local, git-ignored `.env` is the normal credential store. Process
+  environment variables can supply or override its values, and credentials
+  necessarily exist in process memory/environment while the CLI runs. The
+  tool never intentionally logs tokens, client secrets, or OAuth codes.
+- Full detail, rotation, and cleanup: [Strava API setup](docs/strava-api-setup.md#secrets).
+
+Never commit or share `.env`, a client secret, an access/refresh token, or an
+OAuth authorization code.
 
 ## Limitations
 
-- Running only
-- One-athlete personal CLI workflow
-- TCX uploads only
+- Running only — other sports are rejected, not silently treated as running.
+- A one-athlete, personal CLI workflow, not a hosted service.
+- One-time conversion/upload, not continuous sync.
+- TCX output only.
 - No automatic recovery of an activity ID if Strava accepted an upload but
-  never returned a usable upload record
-- No YAML mapping or preset configuration
+  never returned a usable record for it.
+- No YAML mapping or preset configuration (see docs for a future idea).
 
-## Future ideas
+## What this is (and isn't)
 
-- Additional explicit sport mappings
-- YAML presets for sport mapping, metadata, naming, and import policies
-- Richer inspection reports
-- Export/backup of upload state
-- Optional activity naming and description templates
+This is an independent, unofficial personal-migration tool — it is not built
+or endorsed by adidas, Runtastic, or Strava, and it doesn't replace or modify
+either service's own export/import features. It's meant for moving your own
+historical data once, not for ongoing sync, bulk automation on someone
+else's behalf, or replicating adidas' own metrics exactly.
 
-## Development
+## FAQ
 
-```bash
-source .venv/bin/activate
-ruff format .
-ruff check .
-pytest
-```
+**Will my Strava stats match my adidas stats exactly?**
+No — Strava recalculates several derived metrics (elevation gain, moving
+time, pace, segments, best efforts) after import. See
+[Data fidelity](#data-fidelity).
 
-Tests use fake HTTP sessions and never make real Strava API requests.
+**Does this support cycling, swimming, or other sports?**
+Not currently — running only, mapped explicitly to adidas sport type ID `1`.
+
+**Do I have to use the Strava API at all?**
+No — manual upload through Strava's web portal (path A) needs no API
+application, OAuth, or tokens.
+
+**Can rerunning `convert`/`upload` create duplicates?**
+Normally, existing conversion outputs and locally completed uploads are
+skipped. Recognizable Strava duplicate responses can also be reconciled;
+`upload --force` deliberately resubmits and may create a duplicate. See
+[Strava API setup](docs/strava-api-setup.md#duplicate-reconciliation).
+
+**Something looks wrong — where do I look first?**
+[Troubleshooting](docs/troubleshooting.md).
+
+## Documentation
+
+- [Migration guide](docs/migration-guide.md) — full install-to-upload
+  runbook and exact CLI reference.
+- [Strava API setup](docs/strava-api-setup.md) — optional app setup, OAuth,
+  tokens, rate limits, duplicates, and cleanup.
+- [adidas export format](docs/adidas-export-format.md) — export layout,
+  parsing/fallback rules, TCX contents.
+- [Troubleshooting](docs/troubleshooting.md) — concise, recovery-focused
+  answers to common problems.

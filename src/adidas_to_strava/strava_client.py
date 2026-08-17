@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import IO, Protocol
 
 import requests
 
@@ -18,6 +18,68 @@ from .config import StravaSettings, TokenBundle, persist_tokens
 LOGGER = logging.getLogger(__name__)
 API_BASE = "https://www.strava.com/api/v3"
 TOKEN_URL = f"{API_BASE}/oauth/token"
+
+type JsonMapping = Mapping[str, object]
+"""A decoded JSON object, kept intentionally shallow at the HTTP boundary."""
+
+
+class HTTPResponse(Protocol):
+    """Structural shape of an HTTP response, satisfied by `requests.Response`.
+
+    Only the members `StravaClient` actually reads are declared, so
+    lightweight test doubles can conform without inheriting from
+    `requests.Response`.
+    """
+
+    status_code: int
+
+    @property
+    def headers(self) -> Mapping[str, str]:
+        """Response headers, used to read Strava's rate-limit counters."""
+        ...
+
+    def json(self) -> object:
+        """Decode the response body as JSON.
+
+        Returns:
+            The decoded JSON value. Strava always returns a JSON object for
+            the endpoints this client calls.
+
+        Raises:
+            ValueError: If the response body is not valid JSON.
+        """
+        ...
+
+
+class HTTPSession(Protocol):
+    """Structural shape of the HTTP session used for Strava requests.
+
+    `requests.Session` satisfies this protocol directly; tests may supply a
+    minimal fake implementing only `post` and `request`.
+    """
+
+    def post(
+        self,
+        url: str,
+        *,
+        data: Mapping[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> HTTPResponse:
+        """Issue an HTTP POST request, used only for OAuth token exchange."""
+        ...
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, tuple[str, IO[bytes], str]] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ) -> HTTPResponse:
+        """Issue an HTTP request with an explicit method, used for the API."""
+        ...
 
 
 class StravaError(RuntimeError):
@@ -36,8 +98,37 @@ class StravaRateLimitError(StravaAPIError):
     """Strava rate-limit capacity is exhausted or too close to exhaustion."""
 
 
+def _coerce_int(value: object) -> int:
+    """Coerce one decoded JSON value to `int`, matching plain `int()` rules.
+
+    Args:
+        value: A JSON-decoded value expected to represent an integer, such
+            as Strava's numeric or numeric-string IDs.
+
+    Returns:
+        The coerced integer.
+
+    Raises:
+        TypeError: If `value` is not an `int`, `float`, `bool`, or `str`.
+        ValueError: If `value` is a `str` that does not represent an int.
+    """
+    if isinstance(value, int | float | str):
+        return int(value)
+    raise TypeError(f"expected an int-like value, got {type(value).__name__}")
+
+
 @dataclass(frozen=True)
 class RateLimit:
+    """Strava's usage counters for one rate-limit tier (overall or read).
+
+    Attributes:
+        short_limit: Maximum requests allowed in the current 15-minute
+            window.
+        daily_limit: Maximum requests allowed in the current UTC day.
+        short_usage: Requests already used in the current 15-minute window.
+        daily_usage: Requests already used in the current UTC day.
+    """
+
     short_limit: int
     daily_limit: int
     short_usage: int
@@ -45,15 +136,30 @@ class RateLimit:
 
     @property
     def short_remaining(self) -> int:
+        """Return the number of requests left in the current 15-minute window."""
         return self.short_limit - self.short_usage
 
     @property
     def daily_remaining(self) -> int:
+        """Return the number of requests left in the current UTC day."""
         return self.daily_limit - self.daily_usage
 
 
 @dataclass(frozen=True)
 class UploadStatus:
+    """Strava's asynchronous processing state for one submitted upload.
+
+    Attributes:
+        upload_id: Strava's identifier for the upload job.
+        status: Strava's human-readable processing status (for example
+            ``"processing"`` or ``"ready"``).
+        error: Strava's error message, or ``None`` while there is no error.
+            A duplicate-upload error still reports the existing activity in
+            the message text; see `activity_id`.
+        activity_id: The created (or pre-existing, for duplicates) activity
+            ID once known, or ``None`` while the upload is still processing.
+    """
+
     upload_id: int
     status: str
     error: str | None
@@ -61,13 +167,35 @@ class UploadStatus:
 
 
 class StravaClient:
-    """Strava API client with token refresh, bounded retries, and rate safety."""
+    """Strava API client with token refresh, bounded retries, and rate safety.
+
+    Attributes:
+        settings: The current credentials and token state; replaced in place
+            whenever tokens are refreshed.
+        session: The HTTP session used for all requests.
+        sleep: The delay function used between retries; injectable for
+            tests.
+        now: The clock function used for token-expiry and rate-limit
+            calculations; injectable for tests.
+        max_retries: The number of retries allowed for transient failures
+            before an operation gives up and raises.
+        timeout: The ``(connect, read)`` timeout, in seconds, for one HTTP
+            request attempt.
+        short_reserve: The number of requests to keep unused in the current
+            15-minute window before refusing further requests.
+        daily_reserve: The number of requests to keep unused in the current
+            UTC day before refusing further requests.
+        overall_rate_limit: The most recently observed overall rate-limit
+            counters, or ``None`` before any response has reported them.
+        read_rate_limit: The most recently observed read-only rate-limit
+            counters, or ``None`` before any response has reported them.
+    """
 
     def __init__(
         self,
         settings: StravaSettings,
         *,
-        session: requests.Session | None = None,
+        session: HTTPSession | None = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.time,
         max_retries: int = 3,
@@ -75,8 +203,30 @@ class StravaClient:
         short_reserve: int = 5,
         daily_reserve: int = 20,
     ) -> None:
+        """Initialize the client.
+
+        Args:
+            settings: Credentials and any cached tokens to start from.
+            session: The HTTP session to issue requests with; defaults to a
+                new `requests.Session`. Tests may pass any object that
+                conforms to `HTTPSession`.
+            sleep: The delay function called between bounded retries.
+            now: The clock function used to decide token and rate-limit
+                freshness.
+            max_retries: The number of retries allowed for transient
+                failures (timeouts, connection errors, and HTTP 408/425/
+                500/502/503/504) before raising.
+            timeout: The ``(connect, read)`` timeout, in seconds, applied to
+                every HTTP request attempt.
+            short_reserve: The number of requests to keep unused in the
+                current 15-minute window; requests stop early once
+                remaining capacity reaches this reserve.
+            daily_reserve: The number of requests to keep unused in the
+                current UTC day; requests stop early once remaining
+                capacity reaches this reserve.
+        """
         self.settings = settings
-        self.session = session or requests.Session()
+        self.session: HTTPSession = session or requests.Session()
         self.sleep = sleep
         self.now = now
         self.max_retries = max_retries
@@ -87,7 +237,20 @@ class StravaClient:
         self.read_rate_limit: RateLimit | None = None
 
     def authorization_token(self) -> str:
-        """Return a valid access token, refreshing and persisting when needed."""
+        """Return a valid access token, refreshing and persisting when needed.
+
+        A cached access token is reused as-is whenever it still has more
+        than five minutes of validity left, avoiding an unnecessary refresh
+        request. Otherwise the refresh token is exchanged for a new token
+        bundle, which is persisted before being returned.
+
+        Returns:
+            A currently valid Strava access token.
+
+        Raises:
+            StravaAuthError: If no refresh token is available, or if the
+                refresh request fails.
+        """
         expires_at = self.settings.token_expires_at or 0
         if self.settings.access_token and expires_at > int(self.now()) + 300:
             return self.settings.access_token
@@ -98,7 +261,19 @@ class StravaClient:
         return tokens.access_token
 
     def exchange_authorization_code(self, code: str) -> TokenBundle:
-        """Exchange a one-use OAuth authorization code for token credentials."""
+        """Exchange a one-use OAuth authorization code for token credentials.
+
+        Args:
+            code: The one-use authorization code returned by Strava's
+                OAuth redirect or pasted in manually.
+
+        Returns:
+            The token bundle Strava issued; not yet persisted.
+
+        Raises:
+            StravaAuthError: If the code has already been used, is invalid,
+                or the request fails after bounded retries.
+        """
         payload = self._token_request(
             {
                 "client_id": self.settings.client_id,
@@ -110,11 +285,28 @@ class StravaClient:
         return self._parse_tokens(payload)
 
     def persist_token_bundle(self, tokens: TokenBundle) -> None:
-        """Persist a validated token response and use it for future requests."""
+        """Persist a validated token response and use it for future requests.
+
+        Args:
+            tokens: The token bundle to persist, replacing any cached
+                tokens for subsequent requests made by this client.
+        """
         self._apply_tokens(tokens)
 
     def refresh_access_token(self, refresh_token: str) -> TokenBundle:
-        """Refresh an expired access token using Strava's rotating token."""
+        """Refresh an expired access token using Strava's rotating token.
+
+        Args:
+            refresh_token: The refresh token to exchange. Strava rotates
+                refresh tokens, so the bundle returned here supersedes it.
+
+        Returns:
+            The token bundle Strava issued; not yet persisted.
+
+        Raises:
+            StravaAuthError: If the refresh token is invalid, or the
+                request fails after bounded retries.
+        """
         payload = self._token_request(
             {
                 "client_id": self.settings.client_id,
@@ -131,7 +323,28 @@ class StravaClient:
         *,
         external_id: str,
     ) -> UploadStatus:
-        """Submit one TCX file and return Strava's asynchronous upload record."""
+        """Submit one TCX file and return Strava's asynchronous upload record.
+
+        Strava processes uploads asynchronously; the returned status often
+        still shows the upload as processing, with no activity ID yet. Poll
+        `get_upload_status` with the returned `UploadStatus.upload_id` until
+        processing finishes.
+
+        Args:
+            tcx_path: The TCX file to upload.
+            external_id: A caller-chosen identifier Strava echoes back,
+                used here to make re-submission of the same local activity
+                recognizable in Strava's duplicate-detection error text.
+
+        Returns:
+            The initial upload status, which may already report a
+            duplicate error or a completed activity ID.
+
+        Raises:
+            StravaAPIError: If the request fails after bounded retries.
+            StravaRateLimitError: If Strava's rate limit is exhausted or
+                reserved capacity would be exceeded.
+        """
         payload = self._request_json(
             "POST",
             f"{API_BASE}/uploads",
@@ -145,7 +358,19 @@ class StravaClient:
         return self._parse_upload_status(payload)
 
     def get_upload_status(self, upload_id: int) -> UploadStatus:
-        """Retrieve the current asynchronous upload-processing state."""
+        """Retrieve the current asynchronous upload-processing state.
+
+        Args:
+            upload_id: The Strava upload ID returned by `submit_upload`.
+
+        Returns:
+            The current processing status for the upload.
+
+        Raises:
+            StravaAPIError: If the request fails after bounded retries.
+            StravaRateLimitError: If Strava's rate limit is exhausted or
+                reserved capacity would be exceeded.
+        """
         payload = self._request_json("GET", f"{API_BASE}/uploads/{upload_id}")
         return self._parse_upload_status(payload)
 
@@ -160,7 +385,17 @@ class StravaClient:
             env_path=self.settings.env_path,
         )
 
-    def _token_request(self, data: dict[str, str]) -> dict[str, Any]:
+    def _token_request(self, data: dict[str, str]) -> JsonMapping:
+        """Send one OAuth token request, retrying bounded transient failures.
+
+        Network errors and HTTP 408/425/500/502/503/504 responses are
+        retried with backoff up to `max_retries` times; any other failure,
+        including HTTP 429, stops immediately without retrying.
+
+        Raises:
+            StravaAuthError: If Strava is rate limited (HTTP 429), returns
+                a non-retryable error, or retries are exhausted.
+        """
         transient_statuses = {408, 425, 500, 502, 503, 504}
         for attempt in range(self.max_retries + 1):
             try:
@@ -193,12 +428,12 @@ class StravaClient:
         raise AssertionError("unreachable")
 
     @staticmethod
-    def _parse_tokens(payload: dict[str, Any]) -> TokenBundle:
+    def _parse_tokens(payload: JsonMapping) -> TokenBundle:
         try:
             return TokenBundle(
                 access_token=str(payload["access_token"]),
                 refresh_token=str(payload["refresh_token"]),
-                expires_at=int(payload["expires_at"]),
+                expires_at=_coerce_int(payload["expires_at"]),
                 scope=str(payload.get("scope", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -211,7 +446,22 @@ class StravaClient:
         *,
         data: dict[str, str] | None = None,
         file_path: Path | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonMapping:
+        """Send one authorized API request, retrying bounded transient failures.
+
+        Rate-limit capacity is checked before every attempt (see
+        `_ensure_rate_capacity`), and observed rate-limit headers are
+        captured after every response. Network errors and HTTP 408/425/500/
+        502/503/504 responses are retried with backoff up to `max_retries`
+        times; HTTP 429 stops immediately, since Strava's rate limit is
+        already exhausted and retrying would not help.
+
+        Raises:
+            StravaAPIError: If the request fails after bounded retries or
+                Strava returns another non-retryable error.
+            StravaRateLimitError: If Strava returns HTTP 429, or reserved
+                capacity from `_ensure_rate_capacity` would be exceeded.
+        """
         token = self.authorization_token()
         transient_statuses = {408, 425, 500, 502, 503, 504}
         for attempt in range(self.max_retries + 1):
@@ -266,6 +516,22 @@ class StravaClient:
         self.sleep(min(2**attempt + random.random(), 15.0))
 
     def _ensure_rate_capacity(self, *, include_read: bool) -> None:
+        """Raise before a request would push usage past the reserved margin.
+
+        `short_reserve` and `daily_reserve` requests are always kept unused
+        so a burst of local requests cannot itself trigger Strava's hard
+        rate limit; once remaining capacity reaches a reserve, requests
+        stop early with a message naming when the limit resets.
+
+        Args:
+            include_read: Whether to also check the read-only rate-limit
+                tier, skipped for upload submissions which only consume
+                overall (write) capacity.
+
+        Raises:
+            StravaRateLimitError: If either checked tier's remaining daily
+                or 15-minute capacity is at or below its reserve.
+        """
         limits = [("overall", self.overall_rate_limit)]
         if include_read:
             limits.append(("read", self.read_rate_limit))
@@ -285,7 +551,7 @@ class StravaClient:
                     f"Strava {label} 15-minute rate limit is nearly exhausted; resume after {reset}"
                 )
 
-    def _capture_rate_limits(self, response: requests.Response) -> None:
+    def _capture_rate_limits(self, response: HTTPResponse) -> None:
         overall = self._parse_rate_limit(
             response.headers.get("X-RateLimit-Limit"),
             response.headers.get("X-RateLimit-Usage"),
@@ -311,7 +577,7 @@ class StravaClient:
         return RateLimit(short_limit, daily_limit, short_usage, daily_usage)
 
     @staticmethod
-    def _response_json(response: requests.Response, label: str) -> dict[str, Any]:
+    def _response_json(response: HTTPResponse, label: str) -> JsonMapping:
         try:
             payload = response.json()
         except ValueError as exc:
@@ -321,7 +587,7 @@ class StravaClient:
         return payload
 
     @staticmethod
-    def _safe_error_detail(response: requests.Response) -> str:
+    def _safe_error_detail(response: HTTPResponse) -> str:
         try:
             payload = response.json()
         except ValueError:
@@ -332,9 +598,9 @@ class StravaClient:
         return str(value)[:300] if value else ""
 
     @staticmethod
-    def _parse_upload_status(payload: dict[str, Any]) -> UploadStatus:
+    def _parse_upload_status(payload: JsonMapping) -> UploadStatus:
         try:
-            upload_id = int(payload["id"])
+            upload_id = _coerce_int(payload["id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise StravaAPIError("Strava returned an upload response without an ID") from exc
         activity = payload.get("activity_id")
@@ -342,5 +608,5 @@ class StravaClient:
             upload_id=upload_id,
             status=str(payload.get("status") or ""),
             error=str(payload["error"]) if payload.get("error") else None,
-            activity_id=int(activity) if activity is not None else None,
+            activity_id=_coerce_int(activity) if activity is not None else None,
         )

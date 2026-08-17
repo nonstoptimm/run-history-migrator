@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import webbrowser
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -20,7 +21,17 @@ def build_authorization_url(
     redirect_uri: str,
     state: str,
 ) -> str:
-    """Build the official Strava authorization URL with required scopes."""
+    """Build the official Strava authorization URL with required scopes.
+
+    Args:
+        client_id: The Strava API application's client ID.
+        redirect_uri: The localhost callback URI Strava redirects back to.
+        state: An unguessable value echoed back in the callback, used to
+            reject responses that did not originate from this request.
+
+    Returns:
+        The full authorization URL to open in a browser.
+    """
     return f"{AUTHORIZATION_URL}?{
         urlencode(
             {
@@ -60,9 +71,42 @@ def authorize(
     port: int = 8765,
     timeout: int = 180,
     open_browser: bool = True,
-    input_func=input,
+    input_func: Callable[[str], str] = input,
 ) -> TokenBundle:
-    """Authorize interactively, using localhost callback and manual fallback."""
+    """Authorize interactively, using localhost callback and manual fallback.
+
+    When `code` is not supplied, a temporary localhost server listens for
+    Strava's OAuth redirect; if that callback does not arrive within
+    `timeout` seconds (for example, because no browser is available), the
+    caller is prompted with `input_func` to paste the authorization code or
+    full callback URL manually. Every path validates the returned or
+    granted scope before exchanging the code, so an under-scoped
+    authorization is rejected before any token is persisted.
+
+    Args:
+        settings: The current settings, used to build the authorization
+            URL when a localhost callback is attempted.
+        client: The Strava client used to exchange the authorization code
+            and persist the resulting tokens.
+        code: A one-use authorization code to exchange directly, skipping
+            the localhost callback and manual-entry flow entirely.
+        granted_scope: The scope already known to have been granted,
+            validated when `code` is supplied without a callback.
+        port: The localhost port to listen on for Strava's redirect.
+        timeout: The number of seconds to wait for the localhost callback
+            before falling back to manual entry.
+        open_browser: Whether to open the authorization URL automatically.
+        input_func: The function used to prompt for manual code entry;
+            injectable for tests.
+
+    Returns:
+        The exchanged and persisted token bundle.
+
+    Raises:
+        StravaAuthError: If authorization is denied, the callback state
+            does not match, a required scope is missing, no code is ever
+            provided, or the code exchange fails.
+    """
     if code:
         tokens = client.exchange_authorization_code(code)
         _validate_exchange_scope(tokens, granted_scope)
@@ -139,5 +183,12 @@ def authorize(
 
 
 def credentials_location(settings: StravaSettings) -> Path:
-    """Return the local ignored file where refreshed credentials are stored."""
+    """Return the local ignored file where refreshed credentials are stored.
+
+    Args:
+        settings: The settings whose dotenv path should be reported.
+
+    Returns:
+        The resolved dotenv file path.
+    """
     return settings.env_path

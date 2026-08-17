@@ -6,6 +6,7 @@ import argparse
 import logging
 from datetime import date
 from pathlib import Path
+from typing import Protocol, cast
 
 from .config import load_strava_settings
 from .converter import convert, format_summary
@@ -13,6 +14,47 @@ from .inspect_export import format_inspection, inspect_export
 from .strava_auth import authorize, credentials_location
 from .strava_client import StravaAuthError, StravaClient, StravaError, StravaRateLimitError
 from .uploader import format_upload_summary, upload_activities
+
+
+class _BaseArguments(Protocol):
+    command: str
+    verbose: bool
+
+
+class _SelectionArguments(Protocol):
+    since: date | None
+    until: date | None
+    sport: str
+    limit: int | None
+
+
+class _InspectArguments(_SelectionArguments, Protocol):
+    export_path: Path
+    session_id: str | None
+
+
+class _ConvertArguments(_SelectionArguments, Protocol):
+    export_path: Path
+    session_id: str | None
+    output: Path
+    dry_run: bool
+    overwrite: bool
+
+
+class _AuthArguments(Protocol):
+    env_file: Path | None
+    code: str | None
+    scope: str
+    port: int
+    timeout: int
+    no_browser: bool
+
+
+class _UploadArguments(_SelectionArguments, Protocol):
+    output_dir: Path
+    dry_run: bool
+    force: bool
+    env_file: Path | None
 
 
 def _date(value: str) -> date:
@@ -50,6 +92,11 @@ def _add_selection_arguments(parser: argparse.ArgumentParser, *, session: bool) 
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the argparse command tree without parsing process arguments.
+
+    Returns:
+        The configured top-level parser for all supported commands and flags.
+    """
     parser = argparse.ArgumentParser(
         prog="python -m adidas_to_strava",
         description="Inspect and convert adidas Running exports, then optionally upload TCX.",
@@ -93,76 +140,94 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_date_range(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if getattr(args, "since", None) and getattr(args, "until", None):
-        if args.since > args.until:
-            parser.error("--since must be on or before --until")
+    since = cast(date | None, getattr(args, "since", None))
+    until = cast(date | None, getattr(args, "until", None))
+    if since and until and since > until:
+        parser.error("--since must be on or before --until")
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one CLI command while preserving argparse's validation boundary.
+
+    Args:
+        argv: Arguments excluding the executable name, or ``None`` for ``sys.argv``.
+
+    Returns:
+        Zero on success, one for completed conversion/upload runs with item failures,
+        or two when Strava rate limiting stops an upload.
+
+    Raises:
+        SystemExit: When argparse displays help or reports a CLI validation error.
+    """
     parser = build_parser()
-    args = parser.parse_args(argv)
-    _validate_date_range(parser, args)
+    namespace = parser.parse_args(argv)
+    _validate_date_range(parser, namespace)
+    args = cast(_BaseArguments, namespace)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
         format="%(levelname)s: %(message)s",
     )
     try:
         if args.command == "inspect":
-            summary = inspect_export(
-                args.export_path.expanduser(),
-                args.since,
-                args.until,
-                args.sport,
-                args.session_id,
-                args.limit,
+            inspect_args = cast(_InspectArguments, namespace)
+            inspection_summary = inspect_export(
+                inspect_args.export_path.expanduser(),
+                inspect_args.since,
+                inspect_args.until,
+                inspect_args.sport,
+                inspect_args.session_id,
+                inspect_args.limit,
             )
-            print(format_inspection(summary))
+            print(format_inspection(inspection_summary))
             return 0
         if args.command == "convert":
-            summary = convert(
-                export_path=args.export_path.expanduser(),
-                output_dir=args.output.expanduser(),
-                since=args.since,
-                until=args.until,
-                sport=args.sport,
-                dry_run=args.dry_run,
-                limit=args.limit,
-                session_id=args.session_id,
-                overwrite=args.overwrite,
+            convert_args = cast(_ConvertArguments, namespace)
+            conversion_summary = convert(
+                export_path=convert_args.export_path.expanduser(),
+                output_dir=convert_args.output.expanduser(),
+                since=convert_args.since,
+                until=convert_args.until,
+                sport=convert_args.sport,
+                dry_run=convert_args.dry_run,
+                limit=convert_args.limit,
+                session_id=convert_args.session_id,
+                overwrite=convert_args.overwrite,
             )
-            print(format_summary(summary))
-            return 1 if summary.errors else 0
+            print(format_summary(conversion_summary))
+            return 1 if conversion_summary.errors else 0
         if args.command == "auth":
-            settings = load_strava_settings(args.env_file)
-            client = StravaClient(settings)
+            auth_args = cast(_AuthArguments, namespace)
+            settings = load_strava_settings(auth_args.env_file)
+            auth_client = StravaClient(settings)
             authorize(
                 settings,
-                client,
-                code=args.code,
-                granted_scope=args.scope,
-                port=args.port,
-                timeout=args.timeout,
-                open_browser=not args.no_browser,
+                auth_client,
+                code=auth_args.code,
+                granted_scope=auth_args.scope,
+                port=auth_args.port,
+                timeout=auth_args.timeout,
+                open_browser=not auth_args.no_browser,
             )
-            print(f"Strava authorization saved to {credentials_location(client.settings)}")
+            print(f"Strava authorization saved to {credentials_location(auth_client.settings)}")
             return 0
         if args.command == "upload":
-            client = None
-            if not args.dry_run:
-                settings = load_strava_settings(args.env_file)
-                client = StravaClient(settings)
-            summary = upload_activities(
-                args.output_dir.expanduser(),
-                client=client,
-                since=args.since,
-                until=args.until,
-                sport=args.sport,
-                limit=args.limit,
-                dry_run=args.dry_run,
-                force=args.force,
+            upload_args = cast(_UploadArguments, namespace)
+            upload_client: StravaClient | None = None
+            if not upload_args.dry_run:
+                settings = load_strava_settings(upload_args.env_file)
+                upload_client = StravaClient(settings)
+            upload_summary = upload_activities(
+                upload_args.output_dir.expanduser(),
+                client=upload_client,
+                since=upload_args.since,
+                until=upload_args.until,
+                sport=upload_args.sport,
+                limit=upload_args.limit,
+                dry_run=upload_args.dry_run,
+                force=upload_args.force,
             )
-            print(format_upload_summary(summary))
-            return 1 if summary.failed else 0
+            print(format_upload_summary(upload_summary))
+            return 1 if upload_summary.failed else 0
     except StravaRateLimitError as exc:
         print(f"Rate limit stop: {exc}")
         return 2

@@ -4,6 +4,8 @@ import csv
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from adidas_to_strava.converter import convert
 from adidas_to_strava.strava_client import StravaAPIError, UploadStatus
 from adidas_to_strava.upload_state import UploadStateStore
@@ -18,7 +20,7 @@ class FakeUploadClient:
         self.submissions = 0
         self.polls = 0
 
-    def submit_upload(self, *args, **kwargs) -> UploadStatus:
+    def submit_upload(self, tcx_path: Path, *, external_id: str) -> UploadStatus:
         self.submissions += 1
         result = self.statuses.pop(0)
         if isinstance(result, StravaAPIError):
@@ -35,7 +37,7 @@ class FakeUploadClient:
 
 def converted_output(tmp_path: Path, count: int = 1) -> tuple[Path, list[str]]:
     export, sessions = make_export(tmp_path)
-    session_ids = []
+    session_ids: list[str] = []
     for index in range(count):
         session_id = f"session-{index}"
         start_ms = 1_672_531_200_000 + index * 86_400_000
@@ -47,7 +49,7 @@ def converted_output(tmp_path: Path, count: int = 1) -> tuple[Path, list[str]]:
     return output, session_ids
 
 
-def test_dry_run_makes_zero_api_or_state_writes_and_limit_one(tmp_path) -> None:
+def test_dry_run_makes_zero_api_or_state_writes_and_limit_one(tmp_path: Path) -> None:
     output, _ = converted_output(tmp_path, count=2)
     client = FakeUploadClient([])
     summary = upload_activities(
@@ -68,7 +70,7 @@ def test_dry_run_makes_zero_api_or_state_writes_and_limit_one(tmp_path) -> None:
     assert not (output / "upload-state.sqlite3").exists()
 
 
-def test_successful_async_upload_persists_activity_id(tmp_path) -> None:
+def test_successful_async_upload_persists_activity_id(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     client = FakeUploadClient(
         [
@@ -96,7 +98,7 @@ def test_successful_async_upload_persists_activity_id(tmp_path) -> None:
     assert record.strava_activity_id == 99
 
 
-def test_completed_duplicate_is_skipped(tmp_path) -> None:
+def test_completed_duplicate_is_skipped(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     store = UploadStateStore(output / "upload-state.sqlite3")
     store.begin_attempt(session_ids[0], next(output.glob("*.tcx")))
@@ -118,7 +120,7 @@ def test_completed_duplicate_is_skipped(tmp_path) -> None:
     assert client.submissions == 0
 
 
-def test_limit_counts_actionable_activities_after_completed_skip(tmp_path) -> None:
+def test_limit_counts_actionable_activities_after_completed_skip(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path, count=2)
     store = UploadStateStore(output / "upload-state.sqlite3")
     first_tcx = sorted(output.glob("*.tcx"))[0]
@@ -141,7 +143,7 @@ def test_limit_counts_actionable_activities_after_completed_skip(tmp_path) -> No
     assert summary.dry_run == 1
 
 
-def test_interrupted_submitted_upload_resumes_polling(tmp_path) -> None:
+def test_interrupted_submitted_upload_resumes_polling(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     store = UploadStateStore(output / "upload-state.sqlite3")
     store.begin_attempt(session_ids[0], next(output.glob("*.tcx")))
@@ -169,7 +171,7 @@ def test_interrupted_submitted_upload_resumes_polling(tmp_path) -> None:
     assert client.polls == 2
 
 
-def test_poll_timeout_keeps_upload_resumable(tmp_path) -> None:
+def test_poll_timeout_keeps_upload_resumable(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     client = FakeUploadClient(
         [
@@ -196,7 +198,7 @@ def test_poll_timeout_keeps_upload_resumable(tmp_path) -> None:
     assert record.strava_upload_id == 10
 
 
-def test_poll_network_failure_keeps_upload_resumable(tmp_path) -> None:
+def test_poll_network_failure_keeps_upload_resumable(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     client = FakeUploadClient(
         [
@@ -222,7 +224,7 @@ def test_poll_network_failure_keeps_upload_resumable(tmp_path) -> None:
     assert record.strava_upload_id == 10
 
 
-def test_failed_upload_and_malformed_tcx_are_persisted(tmp_path) -> None:
+def test_failed_upload_and_malformed_tcx_are_persisted(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     tcx = next(output.glob("*.tcx"))
     tcx.write_text("<broken>", encoding="utf-8")
@@ -243,7 +245,7 @@ def test_failed_upload_and_malformed_tcx_are_persisted(tmp_path) -> None:
     assert record is not None and record.status == "failed"
 
 
-def test_strava_processing_failure_is_persisted(tmp_path) -> None:
+def test_strava_processing_failure_is_persisted(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     client = FakeUploadClient(
         [
@@ -273,7 +275,7 @@ def test_strava_processing_failure_is_persisted(tmp_path) -> None:
     assert "duplicate" in record.error_warning
 
 
-def test_previous_duplicate_failure_is_reconciled_without_api_call(tmp_path) -> None:
+def test_previous_duplicate_failure_is_reconciled_without_api_call(tmp_path: Path) -> None:
     output, session_ids = converted_output(tmp_path)
     tcx = next(output.glob("*.tcx"))
     store = UploadStateStore(output / "upload-state.sqlite3")
@@ -302,7 +304,7 @@ def test_previous_duplicate_failure_is_reconciled_without_api_call(tmp_path) -> 
     assert record is not None and record.strava_activity_id == 12345
 
 
-def test_upload_date_filter_uses_activity_date(tmp_path) -> None:
+def test_upload_date_filter_uses_activity_date(tmp_path: Path) -> None:
     output, _ = converted_output(tmp_path, count=2)
     summary = upload_activities(
         output,
@@ -318,12 +320,15 @@ def test_upload_date_filter_uses_activity_date(tmp_path) -> None:
     assert summary.selected == 1
 
 
-def test_current_manifest_format_is_backward_compatible(tmp_path, monkeypatch) -> None:
+def test_current_manifest_format_is_backward_compatible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     output, _ = converted_output(tmp_path)
     manifest = output / "manifest.csv"
     with manifest.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    old_fields = [
+        rows: list[dict[str, str]] = list(csv.DictReader(handle))
+    old_fields: list[str] = [
         field for field in rows[0] if field not in {"local_start_date", "start_timezone_offset_ms"}
     ]
     with manifest.open("w", newline="", encoding="utf-8") as handle:
