@@ -1,16 +1,16 @@
+"""Orchestrate adidas export conversion into local TCX files and a manifest."""
+
 from __future__ import annotations
 
-import csv
 import logging
-import os
-import tempfile
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import date
 from pathlib import Path
 
-from .models import ManifestRow, Session
+from .filters import DateRange, validate_sport
+from .manifest import load_manifest, write_manifest
+from .models import ManifestRow, Session, TimedValue, TrackPoint
 from .parsers import (
-    SPORT_TYPE_IDS,
     ParseError,
     index_companions,
     merge_measurements,
@@ -24,13 +24,31 @@ from .parsers import (
 from .tcx import build_tcx, output_filename, utc_timestamp, write_tcx
 
 LOGGER = logging.getLogger(__name__)
-MANIFEST_FIELDS = list(ManifestRow.__dataclass_fields__)
 
 
 @dataclass
 class Summary:
+    """Aggregate outcomes and manifest rows from one conversion run.
+
+    Attributes:
+        scanned_sessions: Session JSON files found before any filtering.
+        before_since: Matching sessions earlier than the inclusive local ``since`` date.
+        after_until: Matching sessions later than the inclusive local ``until`` date.
+        non_sport: Date- and session-matching sessions with an unselected sport ID.
+        malformed_sessions: Session files skipped after a parse warning.
+        eligible_runs: Sessions remaining after filtering, ordering, and limiting.
+        converted: TCX files successfully written; always zero during a dry run.
+        skipped_no_gps: Eligible sessions without a usable timestamped GPS stream.
+        skipped_duplicate: Eligible sessions skipped because output was already converted.
+        missing_hr: GPS-backed sessions without usable optional heart-rate data.
+        missing_elevation: GPS-backed sessions without a separate elevation file.
+        errors: Eligible sessions whose TCX construction or write failed.
+        rows: Ordered manifest records produced for processed eligible sessions.
+    """
+
     scanned_sessions: int = 0
     before_since: int = 0
+    after_until: int = 0
     non_sport: int = 0
     malformed_sessions: int = 0
     eligible_runs: int = 0
@@ -41,45 +59,6 @@ class Summary:
     missing_elevation: int = 0
     errors: int = 0
     rows: list[ManifestRow] = field(default_factory=list)
-
-
-def since_epoch_ms(value: date) -> int:
-    return int(datetime(value.year, value.month, value.day, tzinfo=UTC).timestamp() * 1000)
-
-
-def _load_manifest(path: Path) -> dict[str, dict[str, str]]:
-    if not path.exists():
-        return {}
-    try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            return {
-                row["session_id"]: row
-                for row in csv.DictReader(handle)
-                if row.get("session_id")
-            }
-    except (OSError, csv.Error, KeyError) as exc:
-        LOGGER.warning("Could not read existing manifest %s: %s", path, exc)
-        return {}
-
-
-def _write_manifest(path: Path, rows: dict[str, dict[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=".manifest.", suffix=".tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
-            writer.writeheader()
-            for session_id in sorted(rows):
-                writer.writerow(rows[session_id])
-        os.replace(temporary_name, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def _manifest_row(
@@ -104,30 +83,69 @@ def _manifest_row(
         output_tcx=str(output),
         status=status,
         warning=warning,
+        local_start_date=session.local_start_date.isoformat(),
+        start_timezone_offset_ms=str(session.start_timezone_offset_ms),
     )
 
 
 def convert(
     export_path: Path,
     output_dir: Path,
-    since: date,
+    since: date | None,
+    until: date | None,
     sport: str,
     dry_run: bool = False,
     limit: int | None = None,
     session_id: str | None = None,
     overwrite: bool = False,
 ) -> Summary:
+    """Convert selected adidas sessions to TCX and update the conversion manifest.
+
+    ``export_path`` is the export root containing ``Sport-sessions``. The optional
+    date bounds are inclusive and compare each session's adidas local calendar date.
+    ``sport`` is resolved to supported adidas sport IDs, and ``session_id`` selects
+    one exact canonical session ID. Sessions are ordered by start timestamp and then
+    session ID before ``limit`` is applied.
+
+    GPS is required: JSON is preferred and GPX is used as a fallback. Missing or
+    malformed heart-rate and elevation streams are non-fatal and are reflected in
+    counters or row warnings. Malformed session files, unusable GPS, and TCX failures
+    are logged as warnings or errors as appropriate.
+
+    Unless ``overwrite`` is true, an existing destination or a manifest row already
+    marked ``converted`` is treated as a duplicate. A real run writes TCX files and
+    rewrites ``output_dir/manifest.csv`` with existing rows plus rows for duplicates,
+    skipped sessions, successes, and errors. A dry run reads existing output and
+    manifest state for duplicate detection but creates or modifies no files.
+
+    Args:
+        export_path: Root directory of the extracted adidas export.
+        output_dir: Directory for TCX files and ``manifest.csv``.
+        since: Earliest included adidas local calendar date, inclusive.
+        until: Latest included adidas local calendar date, inclusive.
+        sport: Supported sport selector mapped to adidas sport IDs.
+        dry_run: If true, perform selection and parsing without writing files.
+        limit: Maximum eligible sessions to process after chronological ordering.
+        session_id: Exact canonical adidas session ID to process, if provided.
+        overwrite: If true, process sessions even when output is already recorded.
+
+    Returns:
+        A summary of filtering, conversion outcomes, warnings, and manifest rows.
+
+    Raises:
+        ValueError: If the export layout, filters, or existing manifest are invalid.
+        OSError: If the final manifest cannot be written.
+    """
     sport_sessions = export_path / "Sport-sessions"
     if not sport_sessions.is_dir():
         raise ValueError(f"missing Sport-sessions directory: {sport_sessions}")
-    if sport not in SPORT_TYPE_IDS:
-        raise ValueError(f"unsupported sport {sport!r}; supported: {', '.join(SPORT_TYPE_IDS)}")
+    sport_ids = validate_sport(sport)
+    date_range = DateRange(since=since, until=until)
 
     summary = Summary()
     parsed: list[Session] = []
     session_paths = scan_sessions(sport_sessions)
     summary.scanned_sessions = len(session_paths)
-    cutoff = since_epoch_ms(since)
     for path in session_paths:
         try:
             item = parse_session(path)
@@ -137,10 +155,15 @@ def convert(
             continue
         if session_id and item.session_id != session_id:
             continue
-        if item.start_time_ms < cutoff:
+        if since and item.local_start_date < since:
             summary.before_since += 1
             continue
-        if item.sport_type_id not in SPORT_TYPE_IDS[sport]:
+        if until and item.local_start_date > until:
+            summary.after_until += 1
+            continue
+        if not date_range.contains(item.local_start_date):
+            continue
+        if item.sport_type_id not in sport_ids:
             summary.non_sport += 1
             continue
         parsed.append(item)
@@ -152,8 +175,8 @@ def convert(
 
     companions = index_companions(sport_sessions)
     manifest_path = output_dir / "manifest.csv"
-    existing_manifest = _load_manifest(manifest_path)
-    updated_manifest = dict(existing_manifest)
+    existing_manifest: dict[str, dict[str, str]] = load_manifest(manifest_path)
+    updated_manifest: dict[str, dict[str, str]] = dict(existing_manifest)
 
     for item in parsed:
         files = companions.get(item.session_id)
@@ -169,14 +192,22 @@ def convert(
         )
         if duplicate and not overwrite:
             summary.skipped_duplicate += 1
+            previous = existing_manifest.get(item.session_id, {})
+            status = "converted" if previous.get("status") == "converted" else "duplicate"
             row = _manifest_row(
-                item, gps_file, hr_file, elevation_file, destination, "duplicate", "output already exists"
+                item,
+                gps_file,
+                hr_file,
+                elevation_file,
+                destination,
+                status,
+                "output already exists",
             )
             summary.rows.append(row)
             updated_manifest[item.session_id] = row.as_dict()
             continue
 
-        points = []
+        points: list[TrackPoint] = []
         if files and files.gps_json:
             try:
                 points, gps_warnings = parse_gps_json(files.gps_json)
@@ -202,7 +233,7 @@ def convert(
             updated_manifest[item.session_id] = row.as_dict()
             continue
 
-        heart_rate = []
+        heart_rate: list[TimedValue] = []
         if hr_file:
             try:
                 heart_rate, hr_warnings = parse_heart_rate(hr_file)
@@ -212,7 +243,7 @@ def convert(
         if not heart_rate and not any(point.heart_rate for point in points):
             summary.missing_hr += 1
 
-        elevation = []
+        elevation: list[TimedValue] = []
         if elevation_file:
             try:
                 elevation, elevation_warnings = parse_elevation(elevation_file)
@@ -236,22 +267,29 @@ def convert(
                 summary.errors += 1
                 warning = "; ".join(filter(None, (warning, str(exc))))
                 LOGGER.error("Failed to convert %s: %s", item.session_id, exc)
-        row = _manifest_row(
-            item, gps_file, hr_file, elevation_file, destination, status, warning
-        )
+        row = _manifest_row(item, gps_file, hr_file, elevation_file, destination, status, warning)
         summary.rows.append(row)
         updated_manifest[item.session_id] = row.as_dict()
 
     if not dry_run:
-        _write_manifest(manifest_path, updated_manifest)
+        write_manifest(manifest_path, updated_manifest)
     return summary
 
 
 def format_summary(summary: Summary) -> str:
+    """Render conversion totals without the per-session manifest rows.
+
+    Args:
+        summary: Completed conversion summary.
+
+    Returns:
+        A newline-delimited report suitable for CLI output.
+    """
     return "\n".join(
         (
             f"Scanned sessions: {summary.scanned_sessions}",
             f"Before since date: {summary.before_since}",
+            f"After until date: {summary.after_until}",
             f"Non-running: {summary.non_sport}",
             f"Malformed sessions: {summary.malformed_sessions}",
             f"Eligible runs: {summary.eligible_runs}",
